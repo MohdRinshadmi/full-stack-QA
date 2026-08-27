@@ -1,5 +1,6 @@
 const puppeteer = require('puppeteer-core');
 const path = require('path');
+const cfg = require('./src/config.js');
 
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
@@ -21,9 +22,9 @@ const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
     displayHeaderFooter: true,
     margin: { top: '18mm', bottom: '18mm', left: '14mm', right: '14mm' },
     headerTemplate: `<div style="width:100%;font-family:-apple-system,Helvetica,sans-serif;font-size:7.5pt;color:#8a93a6;padding:0 14mm;display:flex;justify-content:space-between;">
-        <span>Senior Full-Stack Engineer — Interview Master Bank</span><span>Abdul Majeed</span></div>`,
+        <span>${cfg.title}</span><span>${cfg.owner}</span></div>`,
     footerTemplate: `<div style="width:100%;font-family:-apple-system,Helvetica,sans-serif;font-size:7.5pt;color:#8a93a6;padding:0 14mm;display:flex;justify-content:space-between;">
-        <span>500+ Q&amp;A · React · Next.js · Node · Go · Postgres · AWS · AI/RAG · Realtime</span>
+        <span>536 Q&amp;A · React · Next.js · Node · Go · MySQL · Postgres · AWS · AI/RAG · Realtime</span>
         <span>Page <span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
   });
   await browser.close();

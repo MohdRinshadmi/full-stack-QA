@@ -2872,7 +2872,7 @@ Inject the clock. Pass a `now()` function or a `Clock` dependency so tests can c
 - Mocking the database and calling it an integration test.
 - Chasing a coverage number instead of covering risk.
 
-# SECTION Express.js | You have shipped 40+ REST APIs on Express — these must be automatic.
+# SECTION Express.js | You have shipped 40+ REST API endpoints on Express with Sequelize — these must be automatic.
 
 ### How does Express middleware work?
 @short
@@ -4339,7 +4339,7 @@ That the database is reading far more rows than it returns, which means the inde
 - Optimising a query nobody runs often.
 - Using `EXPLAIN` without `ANALYZE` and treating estimates as facts.
 
-# SECTION PostgreSQL & MySQL | The two you have shipped on — know where they differ and why it matters.
+# SECTION PostgreSQL & MySQL | MySQL is your production engine, PostgreSQL your project engine — know exactly where they differ, and never answer for one in the other's syntax.
 
 ### What are the main differences between PostgreSQL and MySQL?
 @short
@@ -4606,7 +4606,7 @@ Rotate immediately and assume it was used: revoke the old credential, issue a ne
 - One superuser credential used by the app, migrations and analysts.
 - A publicly accessible RDS instance "temporarily".
 
-# SECTION MongoDB & Redis | The two non-relational stores on your résumé — know what each is genuinely for.
+# SECTION MongoDB & Redis | The non-relational stores on your résumé — Redis you run in production, so expect that one to go deeper.
 
 ### How do you model data in MongoDB — embed or reference?
 @short

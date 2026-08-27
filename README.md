@@ -1,18 +1,26 @@
 # Senior Full-Stack Engineer — Interview Master Bank
 
-**514 questions with full answers, 794 pages**, generated as a designed PDF.
+**536 questions with full answers, 849 pages**, generated as a designed PDF.
 Mapped to the stack on the résumé: React · Next.js · React Native · TypeScript ·
-Node/Express · Golang/Gin · PostgreSQL · MySQL · MongoDB · Redis · AWS · Docker ·
-CI/CD · Stripe/PayPal/Razorpay · RAG/LLMs/pgvector · WebSockets/Yjs · Clean Architecture.
+Node/Express · Python · Golang/Gin · MySQL/Sequelize · PostgreSQL · MongoDB · Redis ·
+AWS · Docker · Nginx/PM2 · CI/CD · Stripe/PayPal/Razorpay · RAG/LLMs/pgvector ·
+WebSockets/Yjs · Clean Architecture.
+
+Every claim, number and technology is checked against the résumé itself. Production
+work (Infinite Open Source Solution LLP — Express/Sequelize on **MySQL**, payments,
+Docker/Nginx/PM2 on VPS and AWS, React Native in both stores) and self-initiated
+projects (Golang/Gin, pgvector/RAG, Yjs/WebSockets — **no commercial users**) are
+kept deliberately separate, because blurring them is what loses credibility in a
+deep-dive round.
 
 ## Output
 
 | File | Contents | Questions | Pages |
 |---|---|---:|---:|
-| `build/master.pdf` | Everything, one book | **514** | 794 |
+| `build/master.pdf` | Everything, one book | **536** | 849 |
 | `build/part1.pdf` | Fundamentals | 164 | 241 |
-| `build/part2.pdf` | Intermediate & Production | 149 | 239 |
-| `build/part3.pdf` | Hard & Senior-Level | 101 | 159 |
+| `build/part2.pdf` | Intermediate & Production | 169 | 290 |
+| `build/part3.pdf` | Hard & Senior-Level | 103 | 163 |
 | `build/part4.pdf` | Scenario & System Design | 100 | 163 |
 
 ## Answer format

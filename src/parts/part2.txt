@@ -2419,7 +2419,7 @@ Acknowledge quickly, reproduce, assess severity and blast radius, contain (disab
 - Security testing only before launch.
 - Relying entirely on automated scanners for authorisation.
 
-# SECTION Golang & Gin | The second backend language on your résumé — expect comparison questions with Node.
+# SECTION Golang & Gin | Working proficiency from a self-directed project, not production — say so, then answer the comparison questions with Node properly.
 
 ### Why would you choose Go over Node.js for a service?
 @short
@@ -2811,7 +2811,7 @@ No — gRPC-Web needs a proxy, loses HTTP caching, and is harder to debug from a
 - Hand-maintaining TypeScript interfaces mirroring Go structs.
 - Generating the spec but never checking it for breaking changes.
 
-# SECTION ORMs & Data Access | Sequelize, Prisma and GORM — convenience versus control, and the queries they hide.
+# SECTION ORMs & Data Access | Sequelize is on your production CV — convenience versus control, and the queries these hide.
 
 ### What are the real trade-offs of using an ORM?
 @short
@@ -3031,7 +3031,409 @@ In batches, keyed by primary key, with a short pause between them so replication
 - Row-by-row inserts in a loop.
 - One `UPDATE` statement over millions of rows in a live system.
 
-# SECTION PostgreSQL Optimisation | The layer where most "the API is slow" tickets are actually resolved.
+# SECTION MySQL & InnoDB in Production | The engine your production experience is actually on — schema design, index strategy, locking and replication, asked at the depth your CV invites.
+
+### How does InnoDB actually store a table, and why does the primary key choice matter so much?
+@short
+InnoDB tables are clustered: the rows physically live in the leaf pages of the primary-key B+tree, so the primary key *is* the table's storage order. Every secondary index stores the primary key value rather than a row pointer, which means a secondary index lookup that needs columns outside the index costs a second traversal back through the clustered index. Two consequences follow directly — insert order determines fragmentation, and a wide primary key inflates every secondary index on the table.
+@deep
+The insert-order consequence is the one that bites in practice. A sequential primary key like `AUTO_INCREMENT` appends to the rightmost page, filling pages efficiently and never splitting anything in the middle. A random primary key like a UUIDv4 inserts into random pages, so pages split constantly, fill to roughly 50–70% instead of near full, and the index fragments — which means more pages to cache, a bigger working set, and worse buffer-pool hit rate. The table gets larger and slower for a reason that has nothing to do with the query.
+
+The width consequence compounds it. If the primary key is a 36-character UUID stored as `CHAR(36)`, every secondary index row carries 36 bytes of primary key on top of its own columns. With five secondary indexes on a large table that is a substantial and entirely avoidable amount of storage and cache pressure. Storing it as `BINARY(16)` more than halves it; using a `BIGINT` surrogate key with the UUID as a secondary unique key removes it from the secondary indexes altogether.
+
+The second-traversal consequence is why covering indexes matter more in InnoDB than people expect. `Using index` in the `EXPLAIN` `Extra` column means the query was answered entirely from the index leaf and never touched the clustered index — that is the difference between one B+tree traversal and two per matched row, which at a thousand rows is a thousand extra random reads.
+@code sql The primary key decisions, and what each one costs
+-- BAD: random primary key on a high-insert table
+CREATE TABLE events (
+  id CHAR(36) PRIMARY KEY,           -- UUIDv4 as text: random AND 36 bytes
+  device_id BIGINT, payload JSON, created_at DATETIME(3),
+  INDEX idx_device (device_id),      -- silently carries 36 bytes of PK
+  INDEX idx_created (created_at)     -- so does this one
+) ENGINE=InnoDB;
+--  -> random inserts split pages; pages ~60% full; index fragments;
+--     both secondary indexes are far larger than they need to be.
+
+-- GOOD: sequential clustered key, UUID kept as an external identifier
+CREATE TABLE events (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,   -- sequential: append-only
+  uuid BINARY(16) NOT NULL,                        -- 16 bytes, not 36
+  device_id BIGINT UNSIGNED NOT NULL,
+  payload JSON,
+  created_at DATETIME(3) NOT NULL,
+  UNIQUE KEY uq_uuid (uuid),                       -- external lookups still O(log n)
+  KEY idx_device_created (device_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+--  Alternative if you want a single key: UUIDv7 / ULID — time-ordered, so it
+--  inserts sequentially AND is globally unique. UUID_TO_BIN(uuid, 1) also
+--  byte-swaps a UUIDv1 to make it sortable.
+
+-- THE SECOND TRAVERSAL, made visible
+EXPLAIN SELECT device_id, created_at FROM events WHERE device_id = 42;
+--   Extra: Using index                 <- covering: index leaf only, ONE traversal
+EXPLAIN SELECT device_id, payload FROM events WHERE device_id = 42;
+--   Extra: (blank)                     <- payload is not in the index:
+--                                         index -> PK -> clustered index. TWO.
+
+-- utf8 IS NOT UTF-8 IN MYSQL. It is 3 bytes and cannot store an emoji.
+-- Always utf8mb4. This is still the most common production data-loss bug I see.
+@end
+@senior
+The senior version of this answer connects the storage layout to a number someone cares about. Fragmentation is not an aesthetic problem: it increases the number of pages the working set occupies, which reduces the effective buffer-pool hit rate, which turns cached reads into disk reads — so a bad primary key choice shows up as a latency regression months later that looks like it has nothing to do with the schema. I would also name the honest counter-argument, because `AUTO_INCREMENT` is not free: it is a single hot point at the right edge of the index, which historically caused contention on very high concurrent insert rates, and it leaks information and does not work across shards or offline clients, which is exactly why the mobile sync design used client-generated UUIDs. So the answer is not "always use integers" — it is that the clustered key should be sequential and narrow, and any globally unique identifier the application needs belongs in a secondary unique index or in a time-ordered format like UUIDv7. And I would say plainly that `CHAR(36)` for a UUID is the version that is simply wrong, because it takes the cost of both options and the benefit of neither.
+@followup
+How would you fix a table that already has a random UUID primary key?
+@answer
+Carefully, and only if it is actually causing a measurable problem — I would first confirm it with fragmentation and buffer-pool metrics rather than change a primary key on principle. If it is, the change is a full table rebuild, so it goes through gh-ost or pt-online-schema-change rather than a direct `ALTER`, because a primary key change on a large InnoDB table is not an online operation. The sequence is: add the `BIGINT AUTO_INCREMENT` column and a unique index on the existing UUID, backfill in batches, update every foreign key reference to the new column as a separate expand-and-contract migration, and only then swap the primary key. That is several releases of work, which is exactly why the decision is worth getting right at design time. The cheaper intermediate win, if the primary key is `CHAR(36)`, is converting it to `BINARY(16)` — still a rebuild, but a much simpler one, and it shrinks every secondary index immediately.
+@red
+- Not knowing that InnoDB is clustered.
+- Using a random UUID as the clustered primary key on a high-insert table.
+- Storing a UUID as `CHAR(36)`.
+- Using `utf8` instead of `utf8mb4`.
+
+### A production endpoint is slow. How do you diagnose it in MySQL, specifically?
+@short
+Find the query first, then the plan, then fix the cause. The query comes from the slow query log or from `performance_schema.events_statements_summary_by_digest` ordered by total latency — total, not average, because the query that runs ten thousand times at 30ms is usually the real problem, not the one that runs once at 2 seconds. Then `EXPLAIN` to see the chosen plan and `EXPLAIN ANALYZE` to see what actually happened, and the fix follows from which of the three usual causes it is: no usable index, an index that cannot be used because of how the predicate is written, or a plan that is fine but reading far more rows than the result needs.
+@deep
+The digest table is the right starting point rather than the slow query log, because the log has a threshold and the highest-total-cost query is frequently under it. Sorting digests by `SUM_TIMER_WAIT` gives the ranked list of where the database's time actually goes, which is nearly always different from the list of queries anyone suspected.
+
+Reading the plan, the fields that matter are `type`, `key`, `rows` and `Extra`. `type: ALL` is a full table scan; `type: ref` or `range` means an index is being used; `type: const` or `eq_ref` is a unique lookup. `rows` is the optimiser's *estimate* of rows examined, and the gap between that estimate and reality is itself diagnostic — a badly wrong estimate usually means stale statistics, which `ANALYZE TABLE` refreshes. In `Extra`, `Using filesort` means the sort could not be served by an index, `Using temporary` means an intermediate table was materialised, and `Using index` is the good one, meaning the query was covered.
+
+`EXPLAIN ANALYZE` in MySQL 8.0.18+ is the important upgrade, because it executes the query and reports actual time and actual row counts per plan node rather than estimates. The pattern to look for is a node where `actual rows` is orders of magnitude above `estimated rows`, or where a nested loop is executing its inner side thousands of times.
+
+The cause I find most often in an ORM codebase is not a missing index at all — it is an N+1, where the slow "endpoint" is a hundred fast queries. That does not appear as a slow query anywhere; it appears as a high-count digest, which is another reason to sort by total time.
+@code sql The diagnosis, in the order I actually run it
+-- 1. WHERE IS THE TIME GOING? (sort by TOTAL, not average)
+SELECT DIGEST_TEXT, COUNT_STAR,
+       ROUND(SUM_TIMER_WAIT/1e12, 2) AS total_s,
+       ROUND(AVG_TIMER_WAIT/1e9,  2) AS avg_ms,
+       SUM_ROWS_EXAMINED / NULLIF(SUM_ROWS_SENT, 0) AS examined_per_returned
+  FROM performance_schema.events_statements_summary_by_digest
+ ORDER BY SUM_TIMER_WAIT DESC LIMIT 20;
+-- examined_per_returned is the single best smell test. ~1 is a good index.
+-- 4,000 means the server reads 4,000 rows to return one.
+
+-- 2. WHAT PLAN DID IT CHOOSE?
+EXPLAIN SELECT o.id, o.total_minor FROM orders o
+ WHERE o.user_id = 42 AND o.status = 'paid' ORDER BY o.created_at DESC LIMIT 20;
+--  type: ALL          <- full scan
+--  key:  NULL         <- no index used
+--  rows: 482913       <- estimate
+--  Extra: Using where; Using filesort   <- and it sorted 482k rows to return 20
+
+-- 3. WHAT ACTUALLY HAPPENED? (8.0.18+, executes the query)
+EXPLAIN ANALYZE SELECT ...;
+--  -> Sort: o.created_at DESC  (actual time=812..814 rows=20 loops=1)
+--      -> Filter: (o.status = 'paid')  (actual time=0.1..790 rows=1204 loops=1)
+--          -> Table scan on o  (actual time=0.05..610 rows=482913 loops=1)
+--  The 610ms scan is the whole problem, and it is now measured, not guessed.
+
+-- 4. THE FIX, and the verification
+ALTER TABLE orders ADD INDEX idx_user_status_created (user_id, status, created_at DESC),
+  ALGORITHM=INPLACE, LOCK=NONE;
+--  -> type: ref, key: idx_user_status_created, rows: 40, Extra: Using where
+--  -> the ORDER BY is now served by the index: no filesort.
+
+-- 5. IF THE ESTIMATE IS WILDLY WRONG, THE STATISTICS ARE STALE
+ANALYZE TABLE orders;
+
+-- SESSION-LEVEL TRACE when the optimiser's choice is genuinely puzzling:
+SET optimizer_trace = 'enabled=on'; SELECT ...;
+SELECT * FROM information_schema.OPTIMIZER_TRACE\G   -- shows rejected plans and why
+@end
+@senior
+The discipline I would show is measuring before and after on the same query with the same data, and checking that the fix did not move the cost. Adding an index makes reads faster and writes slower, and on a write-heavy table that trade can be a net loss — so after adding one I look at write latency and at whether the index is actually being used, because an unused index is pure cost. `performance_schema` and `sys.schema_unused_indexes` will tell you which indexes have never been read, and dropping those is often a bigger win than adding another. I would also name the `examined_per_returned` ratio as the metric I reach for first, because it is engine-independent reasoning that immediately separates "this query is slow because it does a lot of work" from "this query is slow because it does a lot of *unnecessary* work" — and only the second one is fixable with an index. And I would say explicitly that the slow query log alone is not enough, because the most expensive pattern in an ORM codebase is a hundred fast queries rather than one slow one, and no threshold-based log will ever show you that.
+@followup
+The query is fast in staging and slow in production. Why?
+@answer
+Almost always data volume and data distribution rather than the query. Staging has ten thousand rows where production has ten million, so a plan that scans is fine in one and catastrophic in the other — which is why I test index changes against a restored copy of production data rather than a development database. The other common causes are stale statistics leading the optimiser to a different plan, a buffer pool that holds the whole staging dataset but only a fraction of production's working set so reads that are memory-resident in staging hit disk in production, and skew: a query that is fast for the average user is slow for the one customer with two hundred thousand orders. That last one is worth checking specifically, because it produces the report where "the API is slow" is true for exactly one account and nobody can reproduce it.
+@red
+- Sorting queries by average latency rather than total.
+- Reading `EXPLAIN` without knowing what `Using filesort` or `Using temporary` mean.
+- Adding an index without measuring the write cost or checking it is used.
+- Testing an index change against a development-sized dataset.
+
+### How do you design a composite index for MySQL, and when does one stop being used?
+@short
+Column order is the whole design: equality predicates first, then the range or sort column last. The reason is the leftmost-prefix rule — an index on `(a, b, c)` can serve a query filtering on `a`, on `a, b`, or on `a, b, c`, but not one filtering on `b` alone, because a B+tree is only sorted by `b` within a given `a`. An index stops being used entirely when the predicate is not sargable — a function applied to the column, a leading wildcard, or an implicit type conversion — and each of those turns a fast index lookup into a full scan.
+@deep
+The rule that follows from leftmost-prefix is that an index on `(a, b, c)` makes a separate index on `(a)` redundant, and on a table with many indexes that is usually where the easy wins are: consolidating overlapping indexes reduces write cost and cache pressure without changing a single query.
+
+The range-last rule needs stating precisely, because it is the part people get wrong. Once the optimiser uses a column for a range scan, no column after it in the index can be used for further filtering — the rows within that range are not sorted by the next column. So for `WHERE tenant_id = ? AND status = ? AND created_at > ?`, the correct order is `(tenant_id, status, created_at)`: two equalities, then the range. Putting `created_at` in the middle wastes the columns after it.
+
+The same B+tree ordering is what lets an index serve `ORDER BY` without a filesort — but only if the sort direction is consistent with the index, which is why MySQL 8's descending indexes matter for a query that sorts one column ascending and another descending.
+
+Sargability is the other half. `WHERE DATE(created_at) = '2026-01-01'` cannot use an index on `created_at`, because the index stores the column, not the function of it — rewritten as a half-open range it uses the index perfectly. `WHERE name LIKE '%smith'` cannot use an index for the same reason a phone book cannot find people by the end of their name. And the subtle one is implicit conversion: comparing a `VARCHAR` column to a number makes MySQL convert the *column*, not the literal, which silently disables the index on a query that looks completely ordinary.
+@code sql Index order, and the predicates that quietly disable one
+-- LEFTMOST PREFIX: one index on (a, b, c) serves a | a,b | a,b,c
+CREATE INDEX idx ON orders (tenant_id, status, created_at);
+  WHERE tenant_id=1                                  -- uses it
+  WHERE tenant_id=1 AND status='paid'                -- uses it
+  WHERE tenant_id=1 AND status='paid' AND created_at>? -- uses it fully
+  WHERE status='paid'                                -- CANNOT use it
+  -- => a separate INDEX(tenant_id) is now redundant. Drop it.
+
+-- EQUALITY FIRST, RANGE LAST — this is the rule
+--   (tenant_id, status, created_at)   equality, equality, range   CORRECT
+--   (tenant_id, created_at, status)   equality, RANGE, equality   WRONG:
+--     once created_at is used as a range, `status` after it cannot filter.
+
+-- ORDER BY SERVED BY THE INDEX (no filesort)
+CREATE INDEX idx ON orders (tenant_id, created_at DESC);   -- MySQL 8: real DESC
+  WHERE tenant_id=1 ORDER BY created_at DESC LIMIT 20;     -- index order = sort order
+
+-- COVERING: add the selected columns to the tail to avoid the PK hop
+CREATE INDEX idx ON orders (tenant_id, status, created_at, total_minor);
+  SELECT total_minor ... -> Extra: Using index
+
+-- ============ NOT SARGABLE: the index is silently ignored ============
+WHERE DATE(created_at) = '2026-01-01'            -- function on the column
+WHERE created_at >= '2026-01-01'                 -- FIX: half-open range
+  AND created_at <  '2026-01-02'
+
+WHERE LOWER(email) = 'a@b.com'                   -- function on the column
+-- FIX (MySQL 8): a functional index
+ALTER TABLE users ADD INDEX idx_email_lower ((LOWER(email)));
+
+WHERE name LIKE '%smith'                         -- leading wildcard: full scan
+WHERE name LIKE 'smith%'                         -- prefix: uses the index
+-- for real substring search: FULLTEXT, or a dedicated search engine
+
+WHERE phone = 9876543210                         -- phone is VARCHAR!
+-- MySQL converts THE COLUMN to a number -> index unusable -> full scan.
+WHERE phone = '9876543210'                       -- FIX: match the type.
+
+-- LOW CARDINALITY: an index on a 2-value column is usually useless on its own
+--   (status) alone -> optimiser prefers a scan. As a LEADING column in a
+--   composite with a selective second column, it is fine.
+
+-- FIND THE INDEXES THAT COST AND RETURN NOTHING
+SELECT * FROM sys.schema_unused_indexes;
+SELECT * FROM sys.schema_redundant_indexes;
+@end
+@senior
+The judgement worth showing is that indexes are a budget, not a free win. Every index is written on every insert, update and delete that touches its columns, it occupies buffer pool that would otherwise cache data, and it makes bulk operations and online schema changes slower. So I design the smallest set that covers the actual query patterns rather than adding one per query — which in practice means starting from the digest list of real queries, grouping them by their equality predicates, and building composite indexes that serve several. I would also name the failure mode of the opposite instinct: tables I have inherited with fifteen indexes where `sys.schema_unused_indexes` showed nine had never been read once, and dropping those measurably improved write latency. The other thing I would raise unprompted is the implicit-conversion trap, because it is the one that produces a genuinely baffling incident — the query is correct, the index exists, the plan says full scan, and nothing looks wrong until you notice the column is a `VARCHAR` and the parameter is a number, which is exactly the kind of mismatch an ORM introduces without you writing a line of SQL.
+@followup
+When would you use a prefix index?
+@answer
+On a long string column where the leading characters are selective enough to do the filtering — indexing the first twenty characters of a URL or a long identifier rather than the full column. The reason is that MySQL has a hard index key length limit and a long `VARCHAR` index is expensive in both storage and cache, so a prefix gives most of the selectivity at a fraction of the size. The way to choose the length is to measure it rather than guess: compare `COUNT(DISTINCT LEFT(col, n)) / COUNT(*)` at several values of `n` against the full-column selectivity, and take the shortest prefix that gets close. The important caveat is that a prefix index cannot be a covering index and cannot serve an `ORDER BY`, because it stores only part of the value — so it filters, but the query still has to go back to the row. For an email column I would usually not use a prefix at all, since the leading characters are the selective part but the full column is short enough that the saving is not worth losing coverage.
+@red
+- Putting the range column before an equality column.
+- Creating one index per query instead of composite indexes that serve several.
+- Wrapping an indexed column in a function and expecting the index to work.
+- Comparing a string column to a numeric literal.
+- Never dropping unused indexes.
+
+### Explain InnoDB locking, and how you would debug a deadlock in production.
+@short
+InnoDB does row-level locking, but it locks index records rather than rows — which is the detail that explains most surprising behaviour. Under the default `REPEATABLE READ`, a range query takes gap and next-key locks that block inserts into the gap, so two transactions can deadlock on rows that neither of them modified. To debug one, `SHOW ENGINE INNODB STATUS` reports the most recent deadlock with both transactions, the exact locks each held and waited for, and which one was rolled back; the fix is nearly always to make every transaction acquire locks in the same order, and to make them shorter.
+@deep
+The mechanism matters because it makes the fix obvious. If a query has no usable index, InnoDB has to examine every row, and it locks every index record it examines — so a missing index does not just make a query slow, it makes it lock the entire table in effect. That is why "add the right index" is frequently the actual answer to a locking problem, which is not where people look first.
+
+Deadlocks themselves are not a bug to be eliminated; they are a normal outcome of concurrent transactions taking locks in different orders, and InnoDB detects the cycle and rolls back the cheaper transaction immediately rather than letting it hang. So the application must be prepared to retry a transaction that fails with error 1213, with backoff and a bounded number of attempts. An application that treats a deadlock as a fatal error will show users random failures under load.
+
+The two structural causes are lock ordering and lock duration. Ordering: if one transaction updates order then inventory and another updates inventory then order, they will eventually deadlock — enforcing a consistent order, for example always updating by ascending primary key, makes the cycle impossible. Duration: locks are held until commit, so any external call inside a transaction holds row locks for the duration of a network round trip. Calling a payment API inside a database transaction is the version of this that causes real outages, because a slow provider converts into database lock contention.
+
+The isolation level is worth knowing precisely. MySQL defaults to `REPEATABLE READ`, PostgreSQL to `READ COMMITTED`, so identical application code behaves differently on the two — under `REPEATABLE READ` a consistent snapshot is taken at the first read of the transaction, and gap locking is active, which is why phantom inserts are blocked and why the lock footprint is larger than people expect.
+@code sql Reading a real deadlock, and the fixes that follow
+-- THE DIAGNOSIS
+SHOW ENGINE INNODB STATUS\G          -- section: LATEST DETECTED DEADLOCK
+-- *** (1) TRANSACTION: UPDATE orders SET status='paid' WHERE id=101
+--     WAITING FOR: RECORD LOCK, index PRIMARY of `inventory`, X locks rec
+-- *** (2) TRANSACTION: UPDATE inventory SET qty=qty-1 WHERE sku='A1'
+--     HOLDS: RECORD LOCK on `inventory`
+--     WAITING FOR: RECORD LOCK on `orders`      <- the cycle
+-- *** WE ROLL BACK TRANSACTION (2)
+-- Read it as: who held what, who waited for what. The cycle is always visible.
+
+SET GLOBAL innodb_print_all_deadlocks = ON;   -- log every one, not just the last
+SELECT * FROM performance_schema.data_locks;         -- what is locked RIGHT NOW
+SELECT * FROM sys.innodb_lock_waits;                 -- who is blocking whom
+
+-- FIX 1: consistent lock ordering. This is the real fix.
+--   BAD   tx A: orders -> inventory      tx B: inventory -> orders
+--   GOOD  every transaction touches tables in a fixed order, and rows
+--         in ascending primary-key order:
+SELECT * FROM inventory WHERE sku IN ('A1','B2') ORDER BY id FOR UPDATE;
+
+-- FIX 2: shorter transactions. Locks are held until COMMIT.
+--   BAD                                   GOOD
+--   BEGIN                                 -- call the API FIRST, outside the tx
+--     UPDATE orders ...                   const r = await stripe.charge(...)
+--     await stripe.charge(...)  <-- holds BEGIN
+--     UPDATE ledger ...             locks   UPDATE orders ...; UPDATE ledger ...
+--   COMMIT                                COMMIT
+
+-- FIX 3: the missing index that was the actual cause
+--   No index on the predicate -> InnoDB examines and LOCKS every index record.
+--   UPDATE orders SET x=1 WHERE ref='abc';   -- ref unindexed = table-wide locking
+ALTER TABLE orders ADD INDEX idx_ref (ref);  -- now it locks one record
+
+-- FIX 4: RETRY. A deadlock is normal, not exceptional.
+--   error 1213 ER_LOCK_DEADLOCK   -> retry the whole transaction, 3x, jittered
+--   error 1205 ER_LOCK_WAIT_TIMEOUT -> a lock wait, not a cycle: usually a
+--                                      long transaction holding locks. Find it:
+SELECT * FROM information_schema.innodb_trx ORDER BY trx_started;
+@end
+@senior
+The point I would lead with is that a deadlock is a symptom whose cause is usually somewhere less obvious than the two statements in the error. Three times out of four the underlying problem is a transaction that is longer than it needs to be — often because an HTTP call or a slow computation sits inside it — and shortening it removes the contention entirely without any clever lock ordering. That is also the fix that improves everything else, because long transactions in InnoDB pin the undo log and grow the history list, which degrades reads across the whole server. The second thing I would raise is that the retry has to be at the right level: retrying the failing statement is wrong because the transaction has already been rolled back, so the retry must re-run the entire unit of work, which means the business logic has to be idempotent and re-runnable. That constraint is worth designing for explicitly rather than discovering during an incident. And I would be clear that gap locking under `REPEATABLE READ` surprises people coming from Postgres — two transactions inserting different rows into the same range can block each other, which looks impossible until you know that InnoDB locks gaps rather than rows.
+@followup
+When would you use `SELECT ... FOR UPDATE`, and what is the alternative?
+@answer
+When I need to read a value, make a decision on it, and write it back with a guarantee that nobody else changed it in between — decrementing inventory, allocating a seat, consuming a voucher. `FOR UPDATE` takes an exclusive lock at read time so the read-modify-write is serialised, which is pessimistic locking, and it is the right choice when contention is genuinely likely and a conflict is expensive. The alternative is optimistic locking: read a version column with the row, and make the update conditional on the version being unchanged, so a conflicting concurrent write updates zero rows and the application retries. Optimistic is better when conflicts are rare, because it takes no locks and holds nothing across the read, and it works across a request boundary where you cannot hold a transaction open — an edit form where a user thinks for two minutes cannot use `FOR UPDATE` at all. In practice I use optimistic for user-facing edits and pessimistic for short server-side critical sections over contended rows. The one thing I would avoid is holding `FOR UPDATE` across any external call, for the reasons above.
+@red
+- Not knowing that InnoDB locks index records, so a missing index widens the lock.
+- Treating a deadlock as a bug to eliminate rather than a condition to retry.
+- Retrying the statement instead of the whole transaction.
+- Any network call inside an open transaction.
+- Not knowing MySQL defaults to `REPEATABLE READ` while Postgres defaults to `READ COMMITTED`.
+
+### How do you run Sequelize against MySQL in production without it becoming the bottleneck?
+@short
+Three disciplines: control what SQL it emits, control the connection pool, and keep transactions explicit and short. Concretely — `include` with `separate: true` for `hasMany` so pagination is not broken by row multiplication, `attributes` specified so you are not selecting every column of every join, a pool sized to what MySQL can actually serve rather than an arbitrary number, and a query-count assertion in the integration tests so an N+1 fails CI instead of reaching production. And I read the generated SQL with `logging` on during development, because an ORM that you do not watch will write queries you would never write.
+@deep
+The N+1 is the dominant failure and it has two distinct forms in Sequelize. The obvious one is iterating a result set and calling an association getter per row, which produces one query per row. The subtler one is `include` on a `hasMany` without `separate: true`: Sequelize emits a single `LEFT JOIN`, which multiplies the parent rows by the number of children, so `limit: 20` returns twenty *joined* rows rather than twenty parents — the pagination is silently wrong, and the payload is far larger than expected. `separate: true` issues one query for the parents and one for all their children, which is two queries regardless of page size and is correct with `limit`.
+
+Pool sizing is the second thing people get wrong, usually by making it too large. Each pooled connection is a thread on the MySQL side, and beyond the point where the server can execute them concurrently, more connections make everything slower rather than faster — queries queue inside the database instead of in the application, where at least you can see and control them. The number to reason from is the server's capacity and `max_connections`, divided across every application instance, with headroom left for administrative connections. And `acquire` should be short, so an exhausted pool fails fast with a clear error rather than adding a thirty-second delay to every request.
+
+Transactions need to be explicit, and every query inside one must be passed the transaction object. The most common Sequelize bug I see is a query inside a transaction block that omits `{ transaction: t }` — it runs on a different connection, outside the transaction, so it neither sees the uncommitted writes nor rolls back with them. It produces data inconsistency that only appears when something fails, which is the worst possible time to find it. CLS/AsyncLocalStorage-based automatic transaction propagation removes the whole class of error and is worth enabling.
+@code ts The Sequelize patterns that decide whether production holds
+// ---------- POOL: size it to the database, not to a guess ----------
+new Sequelize(url, {
+  pool: {
+    max: 10,          // per instance. 4 instances x 10 = 40 connections at MySQL.
+                      // Check: SHOW VARIABLES LIKE 'max_connections';
+                      // More is NOT faster — past the server's concurrency,
+                      // queries just queue inside MySQL where you cannot see them.
+    min: 2,
+    acquire: 10000,   // fail fast on an exhausted pool; do not add 30s to a request
+    idle: 10000,
+  },
+  logging: process.env.NODE_ENV !== 'production' ? console.log : false,
+  benchmark: true,    // logs the duration of every query in development
+  define: { underscored: true, timestamps: true },
+  retry: { max: 3, match: [/ER_LOCK_DEADLOCK/] },   // deadlocks are retryable
+});
+
+// ---------- N+1, both forms ----------
+// WRONG: one query per order
+const orders = await Order.findAll({ limit: 20 });
+for (const o of orders) o.items = await o.getItems();      // 20 extra queries
+
+// WRONG IN A SUBTLER WAY: LEFT JOIN multiplies rows, so LIMIT is not 20 parents
+await Order.findAll({ include: [OrderItem], limit: 20 });
+
+// RIGHT: two queries total, LIMIT applies to parents, payload is what you expect
+await Order.findAll({
+  attributes: ['id', 'status', 'total_minor'],             // never SELECT *
+  include: [{ model: OrderItem, separate: true, attributes: ['sku', 'qty'] }],
+  limit: 20,
+  order: [['created_at', 'DESC']],
+});
+
+// ---------- TRANSACTIONS: pass `transaction` to EVERY query ----------
+await sequelize.transaction(async (t) => {
+  await Order.update({ status: 'paid' }, { where: { id }, transaction: t });
+  await Ledger.create({ orderId: id, amountMinor }, { transaction: t });
+  // MISSING `transaction: t` = runs on a DIFFERENT connection, outside the tx.
+  // It will not roll back. This is the #1 Sequelize data-integrity bug.
+});
+// Better: enable CLS so propagation is automatic and cannot be forgotten:
+//   Sequelize.useCLS(new AsyncLocalStorage())
+
+// ---------- THE GUARDRAIL THAT KEEPS IT FIXED ----------
+test('GET /orders issues a bounded number of queries', async () => {
+  const q = countQueries(sequelize);                       // hook beforeQuery
+  await request(app).get('/api/v1/orders?limit=20');
+  expect(q.count).toBeLessThanOrEqual(3);   // an N+1 reintroduced later FAILS CI
+});
+
+// ---------- WHEN TO DROP TO RAW SQL ----------
+// Reporting aggregates, window functions, recursive CTEs, bulk upserts.
+// The ORM is for the 90% of CRUD that is boring; fighting it for the other
+// 10% costs more than writing the query.
+await sequelize.query(sql, { replacements: [ids], type: QueryTypes.SELECT });
+// replacements/bind — NEVER string interpolation. That is SQL injection.
+@end
+@senior
+The position I would take is that an ORM is a productivity tool for the boring majority of queries and a liability for the interesting minority, and knowing which is which is the actual skill. I use it for CRUD, associations and migrations where it removes real drudgery, and I drop to raw parameterised SQL for reporting aggregates, window functions and bulk upserts, because expressing those through the ORM produces something slower and much harder to read than the SQL it is trying to avoid. The failure mode I would name is treating the ORM as a reason not to understand the database — the engineers who get into trouble are the ones who cannot say what SQL a given call emits, and the fix is simply to look: turn query logging on in development and read the output, and a whole class of problem becomes visible before it ships. I would also raise the query-count assertion specifically as the guardrail that matters most in an ORM codebase, because an N+1 is a one-line mistake to reintroduce, it does not show up in code review, and it does not appear in the slow query log — a test that fails when the count changes is the only thing that reliably catches it.
+@followup
+How do you handle bulk inserts through Sequelize?
+@answer
+`bulkCreate` with a batch size rather than a loop of `create`, because a loop is one round trip per row and a bulk insert is one statement for many — the difference at ten thousand rows is minutes versus seconds. I batch in chunks of around a thousand so a single statement does not exceed `max_allowed_packet` or hold locks for too long, and I wrap each batch in its own transaction so a failure does not roll back everything already written. For upserts, `updateOnDuplicate` maps onto MySQL's `ON DUPLICATE KEY UPDATE`, which is one statement rather than a select-then-insert race. Two caveats I would state: `bulkCreate` does not run individual hooks unless you ask it to, and `individualHooks: true` reverts it to per-row queries and destroys the benefit — so any logic in a hook needs to move into the batch operation. And for genuinely large loads, tens of millions of rows, I would leave the ORM entirely and use `LOAD DATA INFILE`, which is an order of magnitude faster than any statement-based approach.
+@red
+- Not knowing what SQL your ORM emits.
+- `include` on a `hasMany` with `limit`, without `separate: true`.
+- Forgetting `transaction: t` on a query inside a transaction.
+- A pool sized far larger than the database can serve.
+- String-interpolating values into a raw query.
+
+### How does MySQL replication work, and how do you handle replica lag?
+@short
+The primary writes every change to its binary log; each replica has an I/O thread that copies that log and an applier thread that replays it locally. It is asynchronous by default, which means a commit on the primary returns before any replica has applied it — so a read routed to a replica immediately after a write can legitimately return the old value. That read-after-write problem is the one that actually shows up in an application, and the fix is to route reads that must see the write to the primary rather than to hope the lag is small.
+@deep
+The two things worth understanding are the format and the failure modes. Row-based binary logging, the modern default, replicates the actual before-and-after row images rather than the statement, which makes replication deterministic — statement-based logging replays the SQL text and breaks on anything non-deterministic like `NOW()` or `UUID()`. Row-based logs are larger but correct, which is the right trade.
+
+Lag has two distinct causes that need different fixes. The first is applier throughput: historically a single applier thread replayed a multi-threaded write workload, so a busy primary could outrun its replica indefinitely — parallel replication with `binlog_transaction_dependency_tracking = WRITESET` lets independent transactions apply concurrently and largely solves it. The second is a single enormous transaction: a bulk update of a million rows commits on the primary in one operation and then has to be applied on every replica, so lag spikes for the duration. That is a schema and application problem, not a replication tuning problem, and it is why backfills are batched.
+
+Semi-synchronous replication changes the guarantee: the primary waits for at least one replica to acknowledge receipt of the log before returning from commit. That bounds data loss on a primary failure to what no replica received, at the cost of adding a network round trip to every commit. It is a real trade rather than a strict improvement, and I would only take it where losing recent transactions is genuinely unacceptable.
+
+GTIDs are what make failover manageable. Without them, promoting a replica means identifying a binary log file and position by hand and hoping. With global transaction identifiers each transaction has a cluster-unique id, so a replica can be pointed at a new primary and work out what it is missing automatically.
+@code text Routing reads correctly, and monitoring lag properly
+  THE TOPOLOGY
+    primary --binlog--> replica 1  (reads)
+            \--binlog--> replica 2  (reads, and analytics/reporting)
+    Reporting on its own replica so a heavy analytical query cannot
+    slow the replicas serving the application.
+
+  READ-AFTER-WRITE — the bug this actually causes
+    POST /orders          -> writes to primary, returns 201
+    GET  /orders/:id      -> routed to a replica, 40ms later
+                          -> 404 or a stale row. "It saved but it is not there."
+
+    FIXES, in order of preference:
+     1. Route to the primary for a short window after a write.
+        Mark the session "recently wrote" (a request-scoped flag or a short
+        Redis key keyed by user) and pin their reads to the primary for a
+        few seconds. Simple, and it fixes the user-visible symptom exactly.
+     2. Route by intent, not by verb: anything in a write flow, anything the
+        user is about to see confirmation of, goes to the primary.
+     3. Return the created resource in the write response so the client does
+        not need to re-read at all. Frequently the best fix.
+     4. Wait for the position: MASTER_POS_WAIT / WAIT_FOR_EXECUTED_GTID_SET.
+        Correct, but it makes the request as slow as the lag.
+
+  MONITORING — Seconds_Behind_Master is not enough on its own
+    SHOW REPLICA STATUS: Seconds_Behind_Master, Replica_IO_Running,
+                         Replica_SQL_Running, Last_Error
+    It reads 0 when the applier has STOPPED, and it is measured against the
+    transaction currently being applied, so it can look fine while an
+    enormous transaction is midway through. Also track:
+      - a heartbeat table written on the primary every second, and the
+        difference between its timestamp and now, read on the replica.
+        This is the number I would actually alert on.
+      - GTID gap: retrieved vs executed set
+      - replica disk and IO saturation
+
+  THE OPERATIONAL RULES
+    alert on lag > a few seconds AND on the applier not running at all
+    batch every backfill — one huge transaction spikes lag on every replica
+    never let the application silently fall back to a lagging replica
+    know the failover story: GTIDs + an orchestrator, and that promotion
+      loses whatever the replica had not received under async replication
+@end
+@senior
+The senior framing is that replicas buy read capacity and disaster recovery, and it is important not to confuse them with either scale or a backup. They are not a backup, because a `DROP TABLE` replicates faithfully to every replica within milliseconds — only point-in-time recovery from a real backup plus binary logs protects against that, and I would say so unprompted because it is the assumption that turns a mistake into a company-ending incident. And they do not scale writes at all: every replica applies the full write workload, so adding replicas to a write-bound system makes it worse rather than better, and the answer there is sharding or a different data model. The other thing I would raise is that read-after-write is a product decision as much as a technical one — the correct behaviour differs between a payment confirmation, where stale data is unacceptable and the read goes to the primary, and a list of recommendations where three seconds of staleness is invisible. Deciding that per-endpoint rather than globally is what makes replica reads usable at all, because the alternative is either pinning everything to the primary and gaining nothing, or accepting stale reads everywhere and shipping confusing bugs.
+@followup
+How would you take a backup without impacting production?
+@answer
+Take it from a dedicated replica rather than the primary, so the cost lands somewhere that is not serving user traffic — that alone solves most of it. For the mechanism, a physical backup with Percona XtraBackup is non-blocking and much faster to restore than a logical dump at any real size, and `mysqldump --single-transaction` is fine for smaller databases because it takes a consistent snapshot without locking under InnoDB. The essential part is binary log retention alongside the backup, because that is what makes point-in-time recovery possible: restore last night's backup, replay the binary log up to the second before the bad statement. And the part I would emphasise most is that a backup that has never been restored is not a backup — I want a scheduled automated restore into an isolated environment with a row-count and checksum verification, because the failure modes are silent, and discovering during an incident that the backups have been failing for three weeks is a well-documented way for a company to die.
+@red
+- Calling replicas a backup.
+- Expecting replicas to help with write load.
+- Trusting `Seconds_Behind_Master` alone.
+- No plan for read-after-write consistency.
+- Never testing a restore.
+
+# SECTION PostgreSQL Optimisation | The engine behind your pgvector and Golang projects — and where most "the API is slow" tickets are actually resolved.
 
 ### How do you read a complex execution plan and decide what to fix?
 @short
@@ -5007,7 +5409,7 @@ I look at the feedback loops: how long does CI take, how often do they deploy, h
 - Reading code alphabetically instead of tracing a request.
 - Proposing a rewrite in the first month.
 
-# SECTION Real-Time Systems & Collaboration | Your stateless WebSocket fan-out with Redis Pub/Sub and Yjs — expect this to be examined closely.
+# SECTION Real-Time Systems & Collaboration | Your stateless WebSocket fan-out with Redis Pub/Sub and Yjs — a self-initiated project, and expect it examined closely anyway.
 
 ### How do you design a WebSocket server that scales horizontally?
 @short
@@ -5200,7 +5602,7 @@ Aggregate rather than subscribing per room. A single Redis hash or sorted set pe
 - Persisting cursor and typing events.
 - Broadcasting presence per join/leave event in large rooms.
 
-# SECTION AI & RAG in Production | Shipping LLM features that are correct, cheap and observable.
+# SECTION AI & RAG in Production | Building LLM features that are correct, cheap and observable — your pgvector and Gemini work, with its provenance stated honestly.
 
 ### How do you build a RAG pipeline end to end?
 @short
@@ -5398,7 +5800,7 @@ Per-user and per-tenant quotas measured in tokens or in currency rather than in 
 - Letting the model's tool calls run with elevated privileges.
 - Relying on "ignore previous instructions" style prompt defences.
 
-# SECTION Frontend Build & Web Performance | Vite migration, Lighthouse and the numbers you claim on your résumé.
+# SECTION Frontend Build & Web Performance | The Create React App to Vite migration, Lighthouse 62 to 89, and every number you claim on your résumé.
 
 ### How exactly did you reduce build time by migrating to Vite?
 @short
@@ -5589,44 +5991,59 @@ First establish whether it is skill, clarity or context — often the expectatio
 
 # SECTION Résumé Deep-Dive Defence | Every number and every claim on your CV, turned into the question an interviewer will actually ask.
 
-### "35% reduction in API response time" — how did you measure it and what did you change?
+### "SQL query and index optimisation cut average API response time by 35%" — how did you measure it, and what did you change?
 @short
-I measured p95 latency per endpoint from APM traces over a week before and a week after, at comparable traffic. The reduction came from three specific changes on the heaviest endpoints: a composite index that removed a sequential scan, batching an N+1 into a single `IN` query, and parallelising three independent downstream calls that had been awaited in sequence.
+This was the Express and Sequelize API on MySQL. I took average and p95 latency per route from structured request logs over a week before and a week after at comparable traffic — 35% is the weighted average across the top endpoints, not a uniform improvement. The reduction came from three specific changes on the heaviest routes: a composite covering index that removed a full table scan, collapsing a Sequelize N+1 into one batched query, and parallelising three independent downstream calls that had been awaited in sequence.
 @deep
-The method matters as much as the number. A single benchmark run proves nothing; comparing p50, p95 and p99 across comparable windows does, and I watched the downstream effects — database CPU, pool wait time, error rate — to be sure I had not simply moved the cost.
+The method matters as much as the number. A single benchmark run proves nothing; comparing average, p95 and p99 across comparable windows does, and I watched the downstream effects — database CPU, connection-pool wait time, error rate — to be sure I had not simply moved the cost somewhere else. I lead with the caveat that average is the weaker statistic, because it hides the tail; I quote it because it is the number on my CV, and I give p95 alongside it unprompted.
 
-The diagnosis came first: a trace showed a 840ms endpoint spending 410ms in one query, 240ms across twenty identical item queries, and 90ms in three serial HTTP calls. Each number pointed at its own fix.
-@code text The exact before/after I would put on a whiteboard
-  ENDPOINT  GET /api/v1/orders?status=paid        p95 840ms → 190ms   (−77% on this route)
-  FLEET     weighted across the top 12 endpoints   p95 —      → −35%
+The diagnosis came first, from the slow query log and per-route timing middleware: an 840ms endpoint was spending 410ms in one query, 240ms across twenty near-identical item queries, and 90ms in three serial HTTP calls. Each number pointed at its own fix.
+@code sql The exact before/after I would put on a whiteboard — MySQL 8, InnoDB
+-- 1. Full table scan on orders (410ms)
+--    EXPLAIN showed type=ALL, rows≈480k, Extra: Using where; Using filesort
+ALTER TABLE orders
+  ADD INDEX idx_orders_user_status_created (user_id, status, created_at DESC, total_minor),
+  ALGORITHM=INPLACE, LOCK=NONE;          -- online, no write blocking
+--    -> type=ref, rows≈40, Extra: Using index  (covering)  => 12ms
+--    Column order is equality-first, then range/sort: user_id, status, then
+--    created_at so the ORDER BY is served by the index instead of a filesort.
+--    total_minor is trailing purely to make the index cover the SELECT list.
+--    Verified with EXPLAIN ANALYZE before and after, not by guessing.
 
-  1. Sequential scan on orders (410ms)
-     → CREATE INDEX CONCURRENTLY ON orders (user_id, status, created_at DESC) INCLUDE (total_minor)
-     → Index Only Scan, 12ms.  Verified with EXPLAIN (ANALYZE, BUFFERS) before and after.
+-- 2. N+1: Sequelize emitted 20 x SELECT ... WHERE order_id = ?   (240ms)
+--    Cause: iterating orders and calling order.getItems() per row.
+--    Fix A: one batched query, grouped in memory
+SELECT * FROM order_items WHERE order_id IN (?);          -- 14ms
+--    Fix B (Sequelize): findAll({ include: [{ model: OrderItem, separate: true }] })
+--    -> exactly two queries regardless of page size, and no row multiplication
+--       from a JOIN against a hasMany, which is what breaks LIMIT.
 
-  2. N+1: 20 × SELECT items WHERE order_id = $1  (240ms)
-     → ONE query: WHERE order_id = ANY($1), grouped in memory. 14ms.
-     → Added a per-request query-count assertion to the test so it cannot regress.
+-- 3. Three independent service calls awaited in series (90ms)
+--    await a; await b; await c  ->  await Promise.all([a, b, c])   => 32ms
 
-  3. Three independent service calls awaited in series (90ms)
-     → Promise.all → 32ms.
+-- 4. Outbound HTTP with no keep-alive agent
+--    new https.Agent({ keepAlive: true }) removed a TLS handshake per call.
+@end
+@arch The result, and the proof it was real
+  ENDPOINT  GET /api/v1/orders?status=paid     avg 840ms -> 190ms   (-77% on this route)
+  FLEET     weighted over the top 12 endpoints avg       -> -35%    (p95 -41%)
 
-  4. Outbound HTTP with no keep-alive agent
-     → https.Agent({ keepAlive: true }) removed a TLS handshake per call.
-
-  MEASURED: Datadog APM, p50/p95/p99 per route, 7 days before vs 7 days after,
-            comparable traffic. Database CPU fell from 62% to 38% — the win was real,
-            not moved somewhere else.
+  MEASURED  per-route timing middleware -> structured logs -> 7 days before
+            vs 7 days after, comparable traffic and comparable data volume.
+  CHECKED   MySQL CPU 62% -> 38%, pool wait p95 140ms -> 9ms, error rate flat.
+            The win was real, not relocated.
 @end
 @senior
-The part I would volunteer without being asked is what I deliberately did not do: I did not put a cache in front of the slow query, because it was slow for a fixable reason and caching would have hidden that while creating a cold-cache cliff later. Fix the cause, then cache what is genuinely expensive. I would also be precise that 35% is a weighted fleet figure, not a uniform improvement — the worst endpoint improved by 77% and several improved not at all — because an interviewer who has done this work knows that uniform improvements are not how it goes.
+The part I volunteer without being asked is what I deliberately did not do: I did not put Redis in front of the slow query. It was slow for a fixable reason, and caching would have hidden that while creating a cold-cache cliff later — so I fixed the query and cached only the genuinely expensive read-heavy endpoints afterwards, which is the order those two bullets actually happened in. I would also be precise that 35% is a weighted average, not a uniform improvement: the worst endpoint improved by 77%, several improved by nothing at all, and one got marginally slower because the new index added write cost. An interviewer who has done this work knows uniform improvements are not how it goes, and volunteering the endpoint that got worse buys more credibility than the one that got better.
 @followup
 How do you know it stayed fixed?
 @answer
-A dashboard with p95 per route and an alert on regression, plus the query-count assertion in the test suite so an N+1 reintroduced by a future change fails CI rather than reaching production. I also review the top queries by total time in `pg_stat_statements` periodically, because new features add new slow queries and the list changes. Performance work that is not protected by a gate erodes within a couple of quarters.
+A dashboard with average and p95 per route and an alert on regression, plus a query-count assertion in the integration tests so an N+1 reintroduced by a future change fails CI rather than reaching production — that one is the important guardrail, because Sequelize makes it a one-line mistake to reintroduce. I also review the top statements by total latency in `performance_schema.events_statements_summary_by_digest` periodically, because new features add new slow queries and the list changes month to month. Performance work that is not protected by a gate erodes within a couple of quarters.
 @red
 - A percentage with no measurement method.
 - Claiming a uniform improvement across every endpoint.
+- Quoting an average and being unable to give the tail.
+- Reciting PostgreSQL syntax for work you did on MySQL.
 
 ### "Migrated the codebase to TypeScript" — how did you do it without stopping feature work?
 @short
@@ -5660,7 +6077,7 @@ What was the hardest part?
 - Claiming a big-bang migration with no feature impact.
 - Measuring success by files converted.
 
-### "Built 40+ REST APIs" — what makes the 41st consistent with the first?
+### "Designed and built 40+ RESTful API endpoints" — what makes the 41st consistent with the first?
 @short
 Shared conventions enforced by shared code: one validation middleware, one error shape, one pagination pattern, one auth pattern, one route helper that types the handler from its schemas. Plus a generated OpenAPI spec, so the contract cannot drift from the implementation.
 @deep
@@ -5814,9 +6231,9 @@ Telemetry from the sync engine: every state transition — tracking started, pro
 - Not mentioning battery.
 - Using AsyncStorage as the durable queue.
 
-### "RAG chatbot with pgvector and HNSW" — what did you learn?
+### "Python data-ingestion pipelines and pgvector retrieval, HNSW-indexed semantic search over thousands of documents" — what did you learn?
 @short
-That retrieval quality dominates everything. Chunking strategy and hybrid search plus reranking moved answer quality far more than prompt engineering or model choice. And that an evaluation set is not optional — without one, every change is a guess and regressions are invisible.
+That retrieval quality dominates everything. Chunking strategy and hybrid search plus reranking moved answer quality far more than prompt engineering or model choice. And that an evaluation set is not optional — without one, every change is a guess and regressions are invisible. I say upfront that this is a self-initiated project with no real users, so every number I quote is from my own golden set, not from production traffic.
 @deep
 The specific improvements that mattered, in order: structure-aware chunking with a contextual header on each chunk, hybrid retrieval fusing vector and keyword results, and a cross-encoder reranker over the top thirty. Each was measurable against a golden set of questions with known correct sources.
 
@@ -5838,13 +6255,15 @@ The operational lessons were about cost and isolation: aborting generation when 
 
   +4  citation enforcement + "not in the documents" refusal path
       accuracy unchanged, but WRONG-and-confident answers fell sharply
-      (the metric that actually mattered to users)
+      (the metric I actually optimised for)
 
-  COST   semantic cache (0.97 threshold) removed ~30% of calls on a support workload
-         output cap + client-disconnect abort removed a further slice of waste
+  COST   semantic cache (0.97 threshold) removed ~30% of calls on a replayed
+         question set; output cap + client-disconnect abort removed more waste
+  CAVEAT self-hosted Postgres, my own corpus, my own 120-question golden set.
+         No production traffic — I say so before I am asked.
 @end
 @senior
-The finding I would emphasise is that keyword search fixed a failure class embeddings simply cannot handle — exact identifiers like error codes and SKUs, where semantic similarity is meaningless. That is why hybrid retrieval is not an incremental tweak but a correctness fix. The second is that the metric users cared about was not accuracy but the rate of confident wrong answers, and the refusal path plus citation enforcement improved that without changing accuracy at all. Choosing the right metric was as important as any technical change.
+The finding I would emphasise is that keyword search fixed a failure class embeddings simply cannot handle — exact identifiers like error codes and SKUs, where semantic similarity is meaningless. That is why hybrid retrieval is not an incremental tweak but a correctness fix. The second is that the metric worth optimising was not accuracy but the rate of confident wrong answers, and the refusal path plus citation enforcement improved that without changing accuracy at all. Choosing the right metric was as important as any technical change.
 @followup
 Why pgvector rather than a dedicated vector database?
 @answer
@@ -5852,74 +6271,876 @@ Because the corpus fitted comfortably in Postgres, and keeping embeddings in the
 @red
 - Attributing quality gains to prompt engineering alone.
 - No evaluation set.
+- Letting a self-initiated project sound like it served real users.
 
-### "Reduced build time by 60%+" — prove it.
+### "Moved the React build from Create React App to Vite, cutting build times 60%+ (~90s to ~35s)" — prove it.
 @short
-Measured with hyperfine over five cold runs on the same machine and commit, before and after. The reduction came from replacing Babel with esbuild, moving type-checking out of the build into a parallel `tsc --noEmit`, and eliminating the development bundle step entirely by serving native ES modules.
+Measured with hyperfine over five cold runs on the same machine and the same commit, before and after: the production build went from about 90 seconds to about 35 seconds, a 61% reduction. The gain came from esbuild replacing Babel for transpilation, type-checking moving out of the build into a parallel `tsc --noEmit`, and dropping the ejected Create React App webpack config with its full source-map and polyfill defaults.
 @deep
-It is important to separate the two numbers, because they improve for different reasons and by different amounts. Development startup and hot-reload improve dramatically, because Vite does not bundle in development at all. The production build improves less, because Rollup still has to bundle and minify — the gain there comes from esbuild-based minification and dropping Babel.
+Two numbers improved for different reasons, and it matters that I separate them. The production build is the 90s → 35s figure and it is bounded, because Rollup still has to bundle, tree-shake and minify — the win there is esbuild-based transform and minification instead of Babel plus Terser. The development experience improved far more than 60%, because Vite does not bundle in development at all: it serves native ES modules and only transforms the file you actually requested, so cold start went from roughly 40 seconds to about 1.5 seconds and hot reload became effectively instant.
 
-Quoting a single blended number without that distinction is where these claims lose credibility.
+Quoting one blended number without that distinction is where these claims lose credibility, so I quote the production build — the smaller and more defensible number — and mention the dev-server gain separately.
 @code bash The measurement, reproducible
 # Same machine, same commit, cold cache, 5 runs each
-hyperfine --warmup 1 --runs 5 --prepare 'rm -rf node_modules/.cache dist .vite' \
-  'npm run build:webpack' 'npm run build:vite'
+hyperfine --warmup 1 --runs 5 --prepare 'rm -rf node_modules/.cache build dist .vite' \
+  'npm run build:cra' 'npm run build:vite'
 
-# Benchmark 1: webpack   380.4 s ± 9.1 s
-# Benchmark 2: vite      131.2 s ± 3.4 s     → 2.90× faster  (−65%)
+# Benchmark 1: react-scripts build    89.6 s ± 2.7 s
+# Benchmark 2: vite build             34.8 s ± 1.1 s   → 2.57x faster  (-61%)
 
-# Dev server cold start, measured to first-byte of the app shell
-# webpack-dev-server   ~95 s
-# vite                 ~2.5 s
+# Dev server cold start, measured to first byte of the app shell
+# react-scripts start   ~40 s        (webpack bundles the whole graph first)
+# vite                  ~1.5 s       (native ESM, transform on request)
 
-# CI wall-clock (includes install, lint, typecheck, test, build)
-# before  14m 10s   →  after  5m 40s
-#   contributions: esbuild transform, parallel tsc, pnpm store cache mount,
-#                  and Turborepo skipping unaffected packages
+# What actually moved the production number
+#   babel-loader -> esbuild transform            ~28 s
+#   fork-ts-checker in-build -> parallel tsc      ~14 s
+#   source-map 'source-map' -> 'hidden-source-map' ~8 s
+#   terser -> esbuild minify                      ~5 s
 @end
 @senior
-Reporting CI wall-clock alongside the build number is what makes this a business claim rather than a benchmark: the thing the team feels is time from push to green, and that improved because of several changes together, not the bundler alone. I would also state the honest caveat that the CI improvement includes caching and monorepo task skipping, so attributing all of it to Vite would be overstating. Being precise about attribution is what makes an interviewer believe the parts you do claim.
+The honest caveat I volunteer is that Create React App was already an unmaintained baseline — it is deprecated, it was pinning us to an old webpack and Babel toolchain, and beating it is not the same as beating a well-tuned modern webpack config. So the real argument for the migration was never the 60%: it was that CRA was a dead dependency we could not upgrade, that `react-scripts` hid the config so we could not fix anything ourselves, and that the build number was the measurable side effect that made the case fundable. Leading with the maintenance argument and treating the number as evidence is what makes this read as engineering judgement rather than a benchmark chase.
 @followup
 Did anything get worse?
 @answer
-Two things. Type errors stopped breaking the dev server, so a developer can now run broken code locally — which is why `tsc --noEmit` became a required CI check and a pre-push hook. And the development and production pipelines diverged, since development uses esbuild and production uses Rollup, so a bug can in principle appear only in the production build; I mitigate that by running a production build in CI on every pull request rather than only on merge.
+Two things. Type errors stopped breaking the dev server, because Vite transpiles without type-checking, so a developer can now run code that does not compile — which is why `tsc --noEmit` became a required CI check and a pre-push hook. And the development and production pipelines diverged, since development uses esbuild over native ESM while production uses Rollup, so a bug can in principle appear only in the production bundle; I mitigate that by running a real production build and a smoke test in CI on every pull request rather than only on merge. There was also a one-off migration cost: `process.env` became `import.meta.env`, `require` and Jest module mocks had to move, and SVG and worker imports needed plugins.
 @red
 - A percentage with no methodology.
-- Claiming the production build improved as much as development.
+- Claiming the production build improved as much as the dev server did.
+- Selling it as a performance win when the real driver was an unmaintained toolchain.
 
-### "Improved Lighthouse scores" — which metric and how?
+### "Code-splitting and CDN assets lifted Lighthouse 62 to 89 and page load 3.8s to 2.1s" — which metric, and how?
 @short
-I optimised for field Core Web Vitals rather than the lab score. The specific fixes were an AVIF hero image with explicit dimensions and `priority`, route-level code splitting that removed the charting library from the landing bundle, deferring third-party scripts, and self-hosted fonts with adjusted fallback metrics.
+Lighthouse mobile went 62 to 89 and the load number I quote is LCP at the p75 of real users, 3.8 seconds to 2.1 seconds. Three changes did almost all of it: route-level code splitting so the landing route stopped downloading the dashboard's charting library, static assets moved to a CDN with long-lived immutable cache headers, and the hero image re-encoded to WebP at the right dimensions with the size reserved so it stopped shifting layout.
 @deep
-The lab score is a proxy; the p75 of real users is what Google grades and what users experience. So I instrumented with `web-vitals` attribution first, which named the LCP element and the interaction responsible for slow INP, and fixed those specifically.
+The lab score is a proxy; the p75 of real users is what Google grades and what the business feels. So I instrumented with the `web-vitals` library first, which named the LCP element and the specific interaction behind slow INP, and fixed those rather than applying general advice.
 
-The largest contributors were not React-level at all: image bytes, JavaScript shipped to a route that did not need it, and render-blocking third-party scripts.
-@code text Field p75, mobile — the numbers and the causes
-  BEFORE   LCP 4.1s   INP 380ms   CLS 0.24   Lighthouse (lab, mobile) 46
-  AFTER    LCP 1.6s   INP 140ms   CLS 0.02   Lighthouse (lab, mobile) 94
+The largest contributors were not React-level at all: image bytes, JavaScript shipped to a route that did not need it, and assets served from the origin behind the same slow connection as the API. This was a Vite build after the Create React App migration, so `manualChunks` and dynamic `import()` were the splitting mechanism and the CDN was an S3 origin behind CloudFront with hashed filenames.
+@code text What moved, and why — lab score and field p75, mobile
+  BEFORE   Lighthouse (lab, mobile) 62   LCP 3.8s   TBT 410ms   CLS 0.19
+  AFTER    Lighthouse (lab, mobile) 89   LCP 2.1s   TBT 150ms   CLS 0.03
 
-  LCP  hero image 1.8MB JPEG, lazy-loaded, no dimensions
-       → next/image, AVIF, sizes set, priority (preloads, no lazy) → 96KB
-       → preconnect to the API origin
-  INP  620KB JS on the landing route; analytics + chat loaded in <head>
-       → route-level lazy(); charts only on /dashboard; moment → date-fns;
-         individual icon imports; third-party via strategy="lazyOnload"  → 180KB
-  CLS  images without dimensions + web font swap + late banner injection
-       → explicit width/height, next/font with adjusted fallback metrics,
-         reserved space for the banner
+  1. CODE SPLITTING                                       LCP -0.9s, TBT -190ms
+     One bundle, 620KB gz, every route's code on first paint.
+     -> React.lazy + Suspense per route; charts, the rich-text editor and the
+        PDF viewer became dynamic import()s reached only on their own routes
+     -> vite manualChunks: react/react-dom in a stable vendor chunk so an app
+        deploy does not invalidate the framework chunk
+     -> moment -> date-fns, per-icon imports instead of the whole set
+     => landing route 620KB -> 180KB gz
 
-  GUARDRAIL  size-limit budget per route in CI + Lighthouse CI on a fixed profile
-             + continuous field RUM so regressions are visible within a day
+  2. CDN ASSETS                                           LCP -0.5s
+     JS, CSS and images served from the app origin, Cache-Control: no-cache.
+     -> S3 + CloudFront, hashed filenames, immutable, max-age=31536000
+     -> index.html stays no-cache so a deploy is picked up immediately
+     -> preconnect to the API origin; modulepreload for the entry chunk
+
+  3. IMAGES + RESERVED SPACE                              LCP -0.3s, CLS -0.16
+     1.8MB JPEG hero, lazy-loaded, no width/height.
+     -> WebP at the served size, eager with fetchpriority="high", explicit
+        width/height, srcset for mobile                    -> 110KB
+     -> font-display: swap with a metric-matched fallback
+
+  GUARDRAIL  size-limit budget per route in CI + Lighthouse CI on a fixed
+             device/network profile + field RUM so regressions show within a day
 @end
 @senior
-The point I would make is that a Lighthouse score is a means, not the goal — it is possible to chase the lab number with tricks that do not help real users, and it is possible to have a mediocre lab score with excellent field data. So I quote both, and I lead with the field p75 because that is what the business cares about. The other honest note is that the biggest wins were unglamorous: image format and size, and not shipping a charting library to a page with no charts. Most performance work is that, not clever React optimisation.
+The point I would make is that a Lighthouse score is a means, not the goal — it is possible to chase the lab number with tricks that do not help real users, and it is possible to have a mediocre lab score with excellent field data. So I quote both, and I lead with the field p75 because that is what the business cares about. I would also be precise that 89 is not 100 deliberately: the remaining gap was third-party analytics and a chat widget the business wanted, and pushing past that would have meant removing features rather than doing engineering — knowing where to stop is part of the work. The other honest note is that the biggest wins were unglamorous: not shipping a charting library to a page with no charts, and putting a cache header on a static file.
 @followup
 How do you prevent regression?
 @answer
-A bundle-size budget per route enforced in CI so a new dependency fails the build, Lighthouse CI against a fixed device and network profile with thresholds, and field monitoring with an alert on p75 regression. Without the CI gate the gains erode within a couple of quarters, because every feature adds a little and nobody notices until the total is bad again. Performance has to be a constraint in the pipeline, not a project that finishes.
+A bundle-size budget per route enforced in CI so a new dependency fails the build, Lighthouse CI against a fixed device and network profile with thresholds, and field monitoring with an alert on p75 regression. Without the CI gate the gains erode within a couple of quarters, because every feature adds a little and nobody notices until the total is bad again — I have seen a single unguarded `import` of a date library put 90KB back on a route. Performance has to be a constraint in the pipeline, not a project that finishes.
 @red
 - Optimising the lab score without field data.
+- Quoting a score with no device and network profile attached.
 - No budget in CI.
+
+### "Designed relational schemas in MySQL — versioned migrations shipped without downtime" — how do you ship a schema change with no downtime?
+@short
+The rule is that the schema and the code must be compatible in both directions during the rollout, because for a period both the old and new versions are running. So every change is expand-then-contract: add the new thing as nullable with a default, backfill in batches, dual-write, switch reads, and only drop the old column in a later release. On MySQL 8 the mechanics matter too — `ALGORITHM=INPLACE, LOCK=NONE` for the changes that support it, and a tool like gh-ost or pt-online-schema-change for the ones that do not.
+@deep
+The failure everyone hits once is deploying a migration that drops or renames a column in the same release as the code that stops using it. During a rolling deploy the old instances are still selecting that column, so you take an outage for the length of the rollout. Renames are the worst case: there is no version of the code that works against both names, which is why a rename is always implemented as add, backfill, dual-write, switch, drop — four releases, never one.
+
+The second failure is a migration that holds a metadata lock. In MySQL an `ALTER TABLE` needs the metadata lock, and a single long-running `SELECT` blocks it — and every query queueing behind that blocked ALTER then blocks too, so one slow report can take the whole table down. That is why `lock_wait_timeout` gets set low for migrations: fail fast and retry rather than pile up.
+
+Backfills are batched and throttled for the same reason. `UPDATE orders SET x = ... WHERE x IS NULL` across half a million rows is one enormous transaction: it holds locks, inflates the undo log, and blows out replica lag. Batches of a few thousand by primary key, with a pause between them and a check on `Seconds_Behind_Master`, are slower to write and dramatically safer.
+@code sql Expand → migrate → contract, the MySQL 8 mechanics
+-- GOAL: orders.customer_ref (VARCHAR) -> orders.customer_id (BIGINT FK)
+-- NEVER as one migration. Four releases.
+
+-- R1 EXPAND — additive only, old code is unaffected
+ALTER TABLE orders
+  ADD COLUMN customer_id BIGINT NULL,
+  ALGORITHM=INSTANT;                     -- MySQL 8.0: adding a nullable column
+                                         -- at the end of the row is metadata-only
+ALTER TABLE orders
+  ADD INDEX idx_orders_customer (customer_id),
+  ALGORITHM=INPLACE, LOCK=NONE;          -- online, writes keep flowing
+
+-- R1 also: application DUAL-WRITES both columns. Reads still use customer_ref.
+
+-- R2 BACKFILL — batched, throttled, resumable, idempotent
+--   run as a job, not as a migration step in the deploy
+UPDATE orders SET customer_id = (SELECT id FROM customers c WHERE c.ref = orders.customer_ref)
+ WHERE customer_id IS NULL AND id BETWEEN ? AND ?     -- 2000-row windows by PK
+ ORDER BY id LIMIT 2000;
+--   between batches: sleep 100ms, and pause if replica lag > 5s
+--   verify: SELECT COUNT(*) FROM orders WHERE customer_id IS NULL;  -- must be 0
+
+-- R3 SWITCH — reads move to customer_id. Still dual-writing. Fully reversible:
+--   a rollback to R2 code works, because both columns are still correct.
+
+-- R4 CONTRACT — only after R3 has been stable in production
+ALTER TABLE orders ADD CONSTRAINT fk_orders_customer
+  FOREIGN KEY (customer_id) REFERENCES customers(id);
+ALTER TABLE orders DROP COLUMN customer_ref;
+
+-- The ones that are NOT online in MySQL 8 (need gh-ost / pt-osc):
+--   changing a column TYPE, adding a column in the MIDDLE of the row,
+--   adding a PRIMARY KEY, converting the character set
+SET SESSION lock_wait_timeout = 5;       -- never queue behind a long SELECT
+@end
+@senior
+The judgement I would show is that the deploy pipeline has to enforce this, not the engineer's memory. Migrations run as a separate step before the application rollout and are required to be backward compatible, so a migration that drops a column fails review by policy rather than by luck. I also keep migrations out of application startup entirely — if every instance runs migrations on boot, a rolling deploy runs them concurrently and you rely on the advisory lock working correctly under a partial failure, which is not a thing to rely on. The other point worth making is about foreign keys: I do use them, because the alternative is discovering orphaned rows two years later, but I am precise that they cost write throughput and make bulk operations harder, so on the highest-volume tables I have used an index and a nightly integrity check instead. That is a trade-off with a reason, not a rule.
+@followup
+How do you roll back a migration that has already run?
+@answer
+Mostly, you do not — you roll forward. Additive changes need no rollback at all, which is the main argument for expand-and-contract: at every intermediate step the previous release still works, so the rollback is a code deploy rather than a schema change. For a genuinely bad migration, a `DROP COLUMN` cannot be undone by re-adding it because the data is gone, so the real recovery is point-in-time recovery from backup plus binlog, which is an outage. That asymmetry is exactly why destructive steps are separated by releases and why I want a column to have been unused in production for a full release cycle before it is dropped. I also test the migration against a restored copy of production data, not against a small development database, because a migration that takes 200ms on 10,000 rows can take 40 minutes on 20 million.
+@red
+- Renaming or dropping a column in the same release that changes the code.
+- Running migrations on application startup.
+- An unbatched backfill in a single transaction.
+- Never having tested the migration against production-sized data.
+
+### "Added Redis caching for read-heavy endpoints and session data" — what did you cache, and how did you invalidate it?
+@short
+Two different things with two different designs. Read-heavy endpoints got cache-aside with a short TTL and explicit invalidation on write, keyed by the exact query parameters and scoped by tenant. Sessions got Redis as the primary store rather than a cache, because in-process sessions do not survive multiple PM2 instances or a restart — that one was about correctness under horizontal scaling, not performance.
+@deep
+The important distinction is that a cache must be allowed to disappear. If losing Redis logs everyone out or corrupts data, it is not a cache, it is a database with no durability guarantees — so I am explicit that session data in Redis is persisted with AOF and treated as a store, while endpoint caches are pure derived data that can be flushed at any time.
+
+For invalidation, TTL alone is a correctness compromise you accept knowingly: a 60-second TTL means up to 60 seconds of stale reads, which is fine for a product listing and unacceptable for an account balance. So writes delete the affected keys, and TTL is only the backstop for the invalidations I inevitably miss. Key design is what makes that possible — a key that encodes the tenant and every parameter that changes the result, with a version prefix so I can invalidate an entire class of keys by bumping the prefix rather than scanning for them.
+
+The two failure modes worth naming are the stampede and the scan. A stampede is what happens when a hot key expires under load: every concurrent request misses, and they all hit the database at once — a single-flight lock or a probabilistic early refresh prevents it. The scan is the operational trap: `KEYS pattern` is O(n) and blocks the single-threaded server, so invalidating by pattern in production is how you cause the incident you were trying to prevent.
+@code ts Cache-aside with single-flight, and the invalidation that goes with it
+// KEY DESIGN — version prefix, tenant scope, every parameter that changes the result
+const key = `v3:t${tenantId}:products:${category}:${page}:${sort}`;
+
+async function getProducts(p: Params) {
+  const hit = await redis.get(key(p));
+  if (hit) return JSON.parse(hit);
+
+  // SINGLE FLIGHT: only one request per key rebuilds; the rest wait briefly.
+  // Without this, a hot key expiring under load sends every concurrent
+  // request to MySQL at the same instant.
+  const lock = await redis.set(`lock:${key(p)}`, '1', 'NX', 'PX', 5000);
+  if (!lock) {
+    await sleep(50);
+    const second = await redis.get(key(p));
+    if (second) return JSON.parse(second);
+    // still nothing: fall through and query rather than wait forever
+  }
+
+  const rows = await db.query(...);                       // the expensive read
+  await redis.set(key(p), JSON.stringify(rows), 'EX', 60); // TTL = backstop only
+  return rows;
+}
+
+// INVALIDATION on write — delete, do not update. An update races with a
+// concurrent rebuild and can leave a stale value with a fresh TTL.
+async function updateProduct(id: string, patch: Patch) {
+  await db.transaction(async t => { await Product.update(patch, { where: { id }, transaction: t }); });
+  await redis.del(`v3:t${tenantId}:product:${id}`);        // exact keys
+  await redis.incr(`v3:t${tenantId}:products:epoch`);      // list keys: bump the epoch
+}
+// Lists embed the epoch in their key, so bumping it invalidates every list
+// query for that tenant in O(1) and the dead keys expire on their own.
+// NEVER: `KEYS v3:t1:products:*` — O(n) on a single-threaded server.
+//        SCAN with a cursor if you truly must, never KEYS.
+
+// SESSIONS are a different contract — a store, not a cache:
+//   connect-redis, AOF everypsec, TTL = session lifetime, sliding on activity.
+//   Losing this logs everyone out, so it is monitored and backed up like a database.
+@end
+@senior
+The thing I would volunteer is what I chose not to cache. Caching is a correctness liability that buys latency, so the first question is always whether the read is slow for a fixable reason — an unindexed query behind a cache is a bug with a timer on it, and it surfaces as a cliff the first time the cache is cold after a restart. The order I actually worked in was: fix the query, measure again, then cache what was still genuinely expensive. I would also name the operational discipline that goes with it: a hit-rate metric per key class, because a cache with a 30% hit rate is adding a network round trip to 70% of requests and making things worse; a memory policy set deliberately — `allkeys-lru` for the cache, `noeviction` for sessions, and separate databases or separate instances so an eviction sweep cannot delete anybody's session; and a test that runs with Redis switched off, because the application must degrade to slow, not to broken.
+@followup
+What happens when Redis goes down?
+@answer
+For the endpoint caches, every request becomes a miss and goes to MySQL — so the real question is whether the database survives the full uncached load, and the honest answer is that it does not, unless you plan for it. That is why the client has a short timeout and a circuit breaker: if Redis is unreachable, fail open to the database immediately rather than adding a five-second timeout to every request, and shed or queue load if the database saturates. For sessions, failing open is not an option — everybody is logged out — which is why that instance runs with AOF persistence and is monitored as a critical dependency rather than treated as disposable. Separating the two concerns is what makes each answer possible.
+@red
+- Treating session data and cached reads as the same problem.
+- `KEYS` in production.
+- Updating a cache entry on write instead of deleting it.
+- No plan for the cold-cache or Redis-down case.
+
+### "Containerised services with Docker and deployed to Linux/VPS and AWS behind Nginx and PM2, with GitHub Actions CI/CD" — walk me through a deploy.
+@short
+Push to main runs the pipeline: install with a lockfile, lint, typecheck, unit and integration tests against a real MySQL and Redis in services containers, then a multi-stage Docker build tagged with the commit SHA and pushed to the registry. Deploy pulls that exact image on the host, starts the new container alongside the old one, waits for its health check to pass, and only then does Nginx switch upstream and the old container stop. Rollback is redeploying the previous SHA, which is roughly ninety seconds.
+@deep
+The two things that make this safe rather than hopeful are the immutable tag and the health gate. Tagging by commit SHA rather than `latest` means the artefact that passed CI is byte-for-byte the artefact that runs, and it makes rollback a deterministic operation rather than a rebuild that might pick up a different transitive dependency. The health gate means a container that cannot reach MySQL never receives traffic — without it, a rolling deploy cheerfully replaces a working service with a broken one.
+
+I should be precise about PM2 versus Docker, because it looks like duplication. Historically the services ran under PM2 directly on the VPS in cluster mode, which is what gives you multiple Node processes across cores and restart-on-crash. As services moved into containers, the process supervision moved to Docker's restart policy and the clustering moved to running multiple containers, and PM2 stayed only where it was still earning its place. Running PM2 inside a container as well is usually the wrong answer — you end up with two supervisors disagreeing about what a crash means, and Docker cannot see the real process health.
+
+Nginx is doing three separate jobs and it is worth naming them separately: TLS termination with certificates from Let's Encrypt on an auto-renew timer, reverse proxying to the application upstreams, and serving static assets directly so Node never handles a file request. The WebSocket routes need the `Upgrade` and `Connection` headers passed through explicitly and a long `proxy_read_timeout`, which is the specific detail that catches people.
+@code yaml The pipeline, and the deploy step that makes rollback trivial
+# .github/workflows/deploy.yml
+jobs:
+  test:
+    services:                              # real dependencies, not mocks
+      mysql:  { image: "mysql:8", env: { MYSQL_ROOT_PASSWORD: test }, ports: ["3306:3306"] }
+      redis:  { image: "redis:7", ports: ["6379:6379"] }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci                        # lockfile, never npm install
+      - run: npm run lint && npx tsc --noEmit
+      - run: npm run migrate && npm test   # migrations must apply cleanly too
+
+  build:
+    needs: test
+    steps:
+      - run: docker build -t $REG/api:${{ github.sha }} .   # SHA, never :latest
+      - run: docker push $REG/api:${{ github.sha }}
+
+  deploy:
+    needs: build
+    environment: production                # requires an approval
+    steps:
+      - run: ssh $HOST "IMAGE=$REG/api:${{ github.sha }} ./deploy.sh"
+# deploy.sh, on the host:
+#   docker pull  $IMAGE
+#   docker run -d --name api-new --health-cmd 'curl -f localhost:3000/health/ready' $IMAGE
+#   wait for healthy (60s timeout) --------------> if unhealthy: rm api-new, EXIT 1
+#   nginx: switch upstream to api-new, reload (graceful, drains in-flight)
+#   docker stop --time=30 api-old   # SIGTERM, 30s to finish in-flight requests
+#   ROLLBACK = re-run deploy.sh with the previous SHA. ~90s.
+@end
+@arch The Dockerfile decisions that matter, and why
+  MULTI-STAGE
+    stage 1  node:20  -> npm ci (all deps) -> tsc build
+    stage 2  node:20-slim -> npm ci --omit=dev -> COPY --from=1 /dist
+    => the compiler, the dev dependencies and the source never ship.
+       ~1.1GB image -> ~180MB, and a smaller attack surface.
+
+  LAYER ORDER   COPY package*.json  ->  npm ci  ->  COPY src
+                (dependencies re-install only when the lockfile changes)
+
+  USER node     never root. A container escape should not be a root escape.
+
+  SIGNALS       no shell-form CMD: `CMD ["node","dist/main.js"]` so the process
+                is PID 1 and receives SIGTERM. With shell form, sh is PID 1,
+                it does not forward the signal, and every deploy kills
+                in-flight requests after a 10s timeout instead of draining.
+
+  GRACEFUL      SIGTERM -> stop accepting new connections, finish in-flight,
+                close the MySQL pool and the Redis client, then exit 0.
+
+  HEALTH        /health/live  = the process is up          (restart if failing)
+                /health/ready = MySQL + Redis reachable    (route traffic if passing)
+                Conflating them means a database blip restart-loops the app.
+
+  SECRETS       injected as environment variables at run time from the CI
+                secret store. Never in the image; a layer is public forever
+                to anyone who can pull it.
+@end
+@senior
+The honest framing I would give is about scale and what it justifies. A single VPS with Nginx, a couple of containers and a health-gated swap is the right architecture for the traffic I was running, and reaching for Kubernetes there would have been resume-driven development — the operational cost would have exceeded the benefit by a wide margin. What I would want to show instead is that I know where this architecture stops: it has no horizontal capacity beyond that box, the deploy has a brief window where both versions are live so the database schema must be compatible with both, and there is a single point of failure I mitigated with monitoring and a fast rebuild rather than with redundancy. Being able to name the limits of your own architecture is a stronger signal than having used a bigger one. The other thing I would raise is that the deploy is only half of it — the pipeline also has to make bad deploys visible, so error rate and p95 latency are watched for the ten minutes after a rollout and a spike triggers an alert that names the deploy as the suspect.
+@followup
+How do you handle secrets and configuration across environments?
+@answer
+Configuration comes from environment variables, validated at startup against a schema so the process refuses to boot with a missing or malformed value rather than failing at 3am on the first request that needs it — that check has caught more misconfigurations than any amount of documentation. Secrets live in the GitHub Actions secret store and are injected at deploy time into the container environment; they are never in the image, never in the repository, and `.env` is gitignored with a committed `.env.example` listing the keys and no values. Each environment has its own credentials with its own database user and its own least-privilege grants, so a staging leak cannot touch production. If I were tightening this further the next step is AWS Secrets Manager or SSM Parameter Store with IAM-scoped access and rotation, which removes the standing copy of the secret in the CI store — I would name that as the known gap rather than pretend the current setup is the end state.
+@red
+- Deploying `:latest`.
+- No health gate before switching traffic.
+- Secrets baked into the image or committed to the repository.
+- Shell-form CMD, so SIGTERM never reaches Node and every deploy drops requests.
+- Not knowing how to roll back.
+
+### "Built a shared API-contract and component library for React, Next.js and React Native clients" — how did you keep three clients in sync?
+@short
+One package holding the types and the runtime validation schemas, imported by the server and by every client, so the contract is a compile-time dependency rather than a document. The schemas are the single source of truth: the server validates requests and responses against them, the clients infer their types from the same definitions, and a breaking change fails the typecheck in CI on every consumer rather than surfacing as a runtime error in the mobile app three weeks later.
+@deep
+The failure this solves is drift. Three clients against one API, with types hand-copied into each, means the moment the server renames a field the clients still compile and fail at runtime — and React Native is the worst case, because a shipped app cannot be fixed by a deploy. Deriving all three from one definition converts that class of bug into a build error.
+
+The component library is a separate problem and the important thing is knowing where sharing stops. React and React Native do not share primitives — `div` and `View` are not interchangeable, styling is CSS versus a style object, and pretending otherwise produces an abstraction that is worse than duplication. So what is genuinely shared is the layer below the components: types, validation schemas, API client functions, formatting and currency helpers, and the design tokens. The components themselves are shared between React and Next.js, where the platform really is the same, and the React Native components are separate implementations against the same tokens and the same hooks.
+
+Next.js adds one specific constraint: a shared component that uses hooks or event handlers cannot be a Server Component, so the package has to mark client entry points with `'use client'` and keep the pure helpers free of it. Getting that wrong turns the whole library into client-side JavaScript and quietly deletes the benefit of Server Components.
+@code ts One schema, one contract, three clients that cannot drift
+// packages/contracts/src/order.ts — the single source of truth
+export const OrderSchema = z.object({
+  id: z.string().uuid(),
+  status: z.enum(['pending', 'paid', 'shipped', 'cancelled']),
+  totalMinor: z.number().int(),          // minor units, never a float
+  currency: z.string().length(3),
+  createdAt: z.string().datetime(),
+});
+export type Order = z.infer<typeof OrderSchema>;      // types DERIVED, never written twice
+
+export const ListOrdersQuery = z.object({
+  status: OrderSchema.shape.status.optional(),
+  cursor: z.string().optional(),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+});
+
+// SERVER — the same schema is the validation middleware
+router.get('/v1/orders', validate({ query: ListOrdersQuery }), async (req, res) => {
+  // req.query is typed AND verified. Not asserted — verified.
+});
+
+// CLIENTS — React, Next.js and React Native import the identical package
+const orders = await api.get('/v1/orders', { query: { status: 'paid' } });
+// Rename `status` on the server -> tsc fails in all three clients in CI.
+// Without this, all three still compile and the mobile app breaks in the field.
+
+// WHAT IS SHARED, AND WHAT IS DELIBERATELY NOT
+// packages/contracts   types + zod schemas + typed api client   -> all three
+// packages/core        formatting, currency, date, hooks        -> all three
+// packages/tokens      colour, spacing, type scale (plain JSON)  -> all three
+// packages/ui-web      React components ('use client' where needed) -> React + Next
+// packages/ui-native   React Native components, same tokens      -> RN only
+//   ^ NOT one component library pretending div and View are the same thing.
+@end
+@senior
+The judgement I would show is knowing what not to share. A shared component library across web and native is a classic over-abstraction: you spend months building a lowest-common-denominator API, every platform-specific requirement becomes a prop, and eventually both platforms are worse than if they had been written separately. Sharing the contract and the tokens gets most of the consistency benefit at a fraction of the cost. The second thing I would raise is versioning, because a shared package inside a monorepo is easy and a shared package consumed by a mobile app is not — an app in the store runs old code for as long as users decline to update, so the API has to stay compatible with contract versions that shipped months ago. That means additive changes only for anything a released app depends on, a minimum-supported-version check that can force an upgrade when it truly matters, and treating the mobile client as a permanently lagging consumer rather than one you can deploy.
+@followup
+How did you handle a breaking API change with an app already in the store?
+@answer
+By not making it breaking. The field is added alongside the old one, both are populated, and the old one is removed only once telemetry shows the versions that read it have fallen below a threshold — which for a mobile app can be a couple of quarters, not a sprint. When a change genuinely cannot be made additive, it goes behind a new API version and the old version keeps working, with a deprecation window measured in months. I also want a minimum-supported-version gate in the client from day one — a lightweight config call that can tell an old build to show an upgrade screen — because without it there is no mechanism at all to retire a version, and you discover that on the day you need one.
+@red
+- Hand-copied types in each client.
+- One component library pretending web and native are the same platform.
+- Treating a released mobile app as something you can deploy a fix to.
+- Making a breaking change without a deprecation window.
+
+### "Shipped React Native apps to the Google Play Store and Apple App Store" — what does that involve beyond writing the app?
+@short
+The engineering is signing, versioning, staged release and crash monitoring. Concretely: managed signing keys that are backed up because losing the Android upload key is unrecoverable, a build number that increments on every upload, a staged rollout starting at a small percentage with crash-free rate watched before it advances, and Sentry with source maps uploaded so a stack trace from a minified production bundle is readable.
+@deep
+The part that surprises people moving from web is that you cannot deploy a fix. A bad release is in users' hands until they update, and the App Store review adds a day or more to any correction, so the release process has to be conservative in a way web deploys do not need to be. That is what staged rollout and the crash-free-sessions metric are for — you expose 5% of users, watch, and halt if the number moves.
+
+The second is that the store review process is a real engineering constraint, not paperwork. An app with background location has to justify the entitlement with a specific user-facing purpose string, and it is rejected if the justification is vague — which for an offline-first tracking app was the single most likely rejection reason. Both stores also require a privacy declaration that must match what the app actually collects.
+
+Version discipline is the third. The user-facing version and the internal build number are different things: the build number must be unique and increasing per upload or the store rejects the binary outright, so it is derived from CI rather than edited by hand.
+@code text The release pipeline, and the parts that are unrecoverable if you get them wrong
+  SIGNING
+    Android  upload key + Play App Signing. Google holds the app signing key;
+             you hold the upload key. LOSE THE UPLOAD KEY -> account recovery
+             with Google, and there is no self-service path. Backed up, encrypted,
+             never in the repository.
+    iOS      certificates + provisioning profiles, managed with fastlane match
+             in a private repo so CI and every machine use the same identity.
+
+  VERSIONING
+    versionName / CFBundleShortVersionString  = user-facing  (1.4.0)
+    versionCode / CFBundleVersion             = CI build number, ALWAYS
+                                                increments, never reused
+
+  RELEASE
+    internal track -> closed testing -> staged rollout 5% -> 20% -> 50% -> 100%
+    gate at each step: crash-free sessions >= 99.5%, ANR rate flat, no spike
+    in the error rate on the API. Halt-and-hold, not halt-and-panic.
+
+  OBSERVABILITY
+    Sentry with SOURCE MAPS uploaded per build. Without them a production
+    stack trace is minified line numbers and is worthless.
+    Track crash-free SESSIONS and crash-free USERS separately: one bad screen
+    can crash 100% of the users who reach it and still look fine by sessions.
+
+  STORE REVIEW — the rejections you can predict
+    background location  -> purpose string must name a concrete user benefit
+    privacy declaration  -> must match what the SDKs actually collect
+    account deletion     -> if there are accounts, in-app deletion is required
+    permissions          -> anything requested and unused is a rejection
+
+  THE POINT: there is no rollback. A bad build is fixed by shipping a new one
+  and waiting for review, so the release process carries the risk instead.
+@end
+@senior
+What I would emphasise is the operational asymmetry between web and mobile, because it changes engineering decisions upstream. On the web a bug is a deploy away from fixed; on mobile the broken version is permanent for some slice of users, so anything that could be wrong belongs behind a server-controlled flag rather than compiled into the binary. That single principle — put the decision on the server, put the mechanism in the app — is what makes a mobile release recoverable, and it is why the API has to keep supporting old clients essentially forever. I would also be honest that over-the-air update tooling covers only the JavaScript bundle: it is genuinely useful for a bad JavaScript-level bug, it does nothing for a native crash, and both stores have rules about what can be changed that way. Knowing where it stops is more useful than knowing that it exists.
+@followup
+How did you test on devices you did not have?
+@answer
+Internal and closed testing tracks first, so real users on real hardware hit the build before any public rollout, and a device-farm run across a matrix of Android versions and manufacturer skins for the smoke path — because Android background behaviour genuinely differs between OEMs and no emulator reproduces a manufacturer's battery optimiser. Beyond that, the substitute for a device you cannot hold is telemetry: device model, OS version, available memory and battery-optimisation state attached to every crash and to the sync-engine events, so a report of "it stops tracking on some phones" becomes a query that names the manufacturer. That is how the background-location bugs were actually found, and it is the answer I would give, because pretending you tested on forty devices is not credible.
+@red
+- No staged rollout.
+- Sentry without source maps.
+- Not knowing the difference between a version name and a build number.
+- Assuming a bad release can be rolled back.
+
+### "Built a Golang backend on Clean Architecture — repository and service-layer separation with dependency injection" — why Go, and what did that architecture actually buy you?
+@short
+This is the self-initiated IoT analytics platform, self-hosted Postgres and Redis with no commercial users, and I say that before I am asked. I chose Go for the ingestion path deliberately: high-frequency telemetry is a concurrency problem, and goroutines with bounded worker pools plus a single static binary made the write path cheap and the deployment trivial. Clean Architecture bought me one thing I can demonstrate rather than assert — handlers, services and repositories are separated by interfaces, so the service logic is tested against an in-memory repository with no database running at all.
+@deep
+The dependency rule is the whole point: the service layer defines the interface it needs, and the Postgres repository implements it. Dependencies point inward, so nothing in the business logic imports GORM or Gin. Wiring happens once in `main`, which is the only place that knows a concrete database exists.
+
+The monorepo splits backend, frontend and infrastructure, which matters more than it sounds: the Docker Compose file that brings up Postgres, Redis and the broker lives beside the code it runs, so the project is reproducible with one command rather than a README full of prerequisites.
+@code text The layering, and where the dependency arrows point
+  cmd/api/main.go        ← the ONLY place that knows Postgres exists
+     │  builds: pgRepo := postgres.NewDeviceRepo(db)
+     │          svc    := service.NewDeviceService(pgRepo, cache)
+     │          h      := http.NewHandler(svc)
+     ▼
+  internal/http/         Gin handlers — decode, validate, call service, encode
+     │                   knows NOTHING about SQL
+     ▼
+  internal/service/      business rules; defines the interface it needs:
+     │                     type DeviceRepo interface {
+     │                       Save(ctx, Reading) error
+     │                       Latest(ctx, id) (Reading, error)
+     │                     }
+     ▼
+  internal/repository/   GORM + Postgres implements DeviceRepo
+                         swappable for an in-memory fake in tests
+
+  RESULT   service tests run with an in-memory DeviceRepo — no container,
+           no fixtures, no truncate-between-tests. Full suite in ~2s.
+@end
+@code text The ingest path — where Go actually earned its place
+  device ──MQTT──► broker ──► subscriber goroutine
+                                  │
+                                  ▼
+                         buffered channel (cap 10k)   ← backpressure lives here
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+              worker pool (N=GOMAXPROCS)   drop + count if full
+                    │                      (a metric, never a silent loss)
+                    ▼
+         batched COPY / multi-row INSERT every 200 readings or 1s
+                    │
+                    ▼
+         readings(device_id, ts, metric, value)
+           PRIMARY KEY (device_id, ts, metric)
+           BRIN index on ts          ← time-ordered inserts, tiny index
+           partitioned BY RANGE (ts) ← old months dropped, not DELETEd
+
+  WHY BATCHING   one INSERT per reading was the first version and it was
+                 the bottleneck — per-statement round-trip and WAL overhead
+                 dominated. Batching was ~20x on my hardware.
+  CACHE          Redis holds "latest reading per device" — the dashboard
+                 polls that, so the hot read never touches Postgres.
+@end
+@senior
+The honest senior answer is that Clean Architecture is over-engineering for a small service, and I would not defend it as universally correct — I would defend the one property I actually got from it, which is that the business logic is testable without infrastructure. That is worth the indirection; the folder ceremony on its own is not. If I were doing it again at this size I would keep the interface boundary and flatten the directory structure.
+
+The second point is the drop counter. A bounded channel that silently discards telemetry under load is a data-loss bug disguised as resilience, so the drop path increments a metric and alerts. Knowing you dropped readings is a different situation from discovering it a week later in a report.
+@followup
+Why not use Node, which you know better?
+@answer
+For most of this Node would have been fine, and I would say so rather than pretending Go was necessary. The specific reason was the fan-in write path: thousands of concurrent device connections with CPU-bound decoding is where Node's single-threaded event loop needs worker threads or clustering, and Go's scheduler handles it with goroutines as the default programming model rather than as an escape hatch. The static binary and the memory profile were secondary benefits. The honest framing is that I chose it partly to learn Go properly on a real workload, and it turned out to fit the problem.
+@red
+- Presenting a self-initiated project as production experience.
+- Reciting Clean Architecture layers without naming a benefit you actually got.
+- An unbounded channel, or a bounded one that drops silently.
+
+### "Built the Node.js API layer for a voice-first AI assistant — streaming LLM responses, speech-to-text and TTS orchestration, server-side tool/function calling" — walk me through a single utterance.
+@short
+Again, self-initiated and no real users. A single utterance is a pipeline where latency is the product: audio streams up while the user is still speaking, partial transcripts come back continuously, and the moment the endpoint-detector says they have stopped, I send the final transcript to the model and start streaming tokens out. Time-to-first-audio is the metric that decides whether it feels like a conversation or a form submission, so TTS starts on the first complete clause rather than the complete answer.
+@deep
+The orchestration problem is that three streams run at different rates — audio in, tokens out, audio out — and the server is the only place that can coordinate them. Doing it client-side means the round trips serialise and the assistant feels slow.
+
+Barge-in is the requirement that shapes the design: if the user starts speaking while the assistant is talking, everything in flight must be cancelled — the LLM request aborted, the TTS queue flushed, and playback stopped — otherwise the assistant talks over the user and the session is unusable.
+@code text One utterance, with the latency budget that matters
+  t=0     mic opens; audio chunks stream to server over WebSocket
+          │  STT is streaming — partial transcripts arrive continuously
+          │  (partials drive the on-screen text; they are NOT sent to the LLM)
+          ▼
+  t=~0    endpoint detected (silence + VAD) → FINAL transcript
+          │
+          ▼
+  +120ms  LLM request opens with AbortController; tokens stream back
+          │
+          │  first COMPLETE CLAUSE (~", " or sentence end) ──┐
+          ▼                                                  ▼
+  +380ms  ── TIME TO FIRST AUDIO ──               TTS synthesises clause 1
+          │                                        while clause 2 is still
+          │                                        being generated
+          ▼
+          audio chunks stream to client, played in order
+
+  BARGE-IN  user speaks mid-answer →
+              abortController.abort()   (stop token generation, stop billing)
+              ttsQueue.clear()          (drop unsynthesised clauses)
+              client stops playback     (drop buffered audio)
+            all three, or the assistant talks over the user.
+
+  DISCONNECT  client socket closes → same abort path. Without it you pay
+              for tokens nobody will ever hear.
+@end
+@senior
+The design decision I would defend hardest is sentence-level TTS chunking. Waiting for the full LLM answer before synthesising is the obvious implementation and it roughly triples perceived latency; chunking on clause boundaries overlaps generation with synthesis and is the single biggest win in the pipeline. The cost is prosody — the speech engine cannot apply sentence-level intonation it has not seen yet — so it is a genuine trade, not a free optimisation, and I would say that rather than pretending it is strictly better.
+
+The second is that partial transcripts must never reach the model. They change as the recogniser revises, so acting on them means acting on words the user did not say — and if a tool call fires from a partial, you have taken a real action on a misheard instruction.
+@followup
+How do you keep the cost of this bounded?
+@answer
+Aborting on disconnect and on barge-in, which is the largest saving because abandoned utterances are common in voice. Then a hard output-token cap, because a runaway answer is both expensive and unlistenable. Then choosing the model per turn rather than globally — a short conversational reply does not need the largest model, and routing simple turns to a cheaper one cut my costs substantially with no quality complaint on my own test set. I also cap conversation history by tokens rather than by message count, since one long tool result can otherwise blow the context budget on its own.
+@red
+- Sending partial transcripts to the model.
+- No abort path on disconnect or barge-in.
+- Waiting for the complete answer before starting TTS.
+
+### "Secured the API with JWT refresh-token rotation and Redis rate limiting" — what does rotation actually protect against, and how do you detect theft?
+@short
+Rotation turns a stolen refresh token from permanent access into a detectable event. Every refresh issues a new refresh token and invalidates the old one, so if a token is ever presented twice, either the legitimate client or the attacker is using a token that has already been spent — and that reuse is the signal. On detection I revoke the entire token family, which logs out the attacker and the user together, deliberately, because a forced re-login is a far better outcome than silent ongoing access.
+@deep
+The mechanism needs a family identifier. Each refresh token carries the id of its lineage, and the server stores the currently valid token per family. Reuse of a superseded token means the lineage is compromised, and the whole family is killed rather than just that token.
+
+Access tokens stay short-lived and stateless — fifteen minutes — because checking a denylist on every request would put Redis in the path of every call. The refresh endpoint is where state lives, and it is called rarely, so the cost is acceptable there.
+@code text Rotation, reuse detection, and what the limiter actually protects
+  REFRESH FLOW
+    client → POST /auth/refresh  { rt_7 }
+    server:  lookup family F of rt_7
+             is rt_7 the CURRENT token of F?
+               yes → issue at_new (15m) + rt_8; current(F) = rt_8; store used(rt_7)
+               no  → rt_7 was already spent  ══► REUSE DETECTED
+                       revoke ENTIRE family F
+                       force re-login, alert, log device + IP
+
+  WHY IT WORKS
+    attacker steals rt_7 and uses it first  → user's next refresh fails → detected
+    user refreshes first, attacker uses rt_7 → server sees spent token → detected
+    either way, the theft surfaces on the NEXT refresh, not months later
+
+  STORAGE   Redis: rt:<jti> → {family, used}   TTL = refresh lifetime
+            revocation is per family, so it is one key delete, not a scan
+
+  RATE LIMITING — different limits for different failure modes
+    /auth/login    5 / 15min per (IP + account)   ← credential stuffing
+    /auth/refresh  10 / min per family            ← token abuse
+    LLM endpoints  per-user token budget, not request count
+                   (one request can cost 1000x another)
+    general API    sliding-window per user; 429 + Retry-After
+
+  ALGORITHM  sliding-window counter in Redis, not fixed-window — a fixed
+             window lets 2x the limit through across a boundary.
+             Increment and expiry in one Lua script so it is atomic.
+@end
+@senior
+The trade-off worth naming is the race between rotation and concurrent requests. A client that fires three requests at once on an expired access token will attempt three refreshes, two of which present a token that is about to be superseded — and a naive implementation reads that as theft and logs the user out. The fix is a short grace window where the immediately-previous token is accepted without rotating again, plus a single-flight refresh on the client so only one refresh is ever in progress. I have seen this exact bug reported as "the app randomly logs me out", and it is the reason rotation is harder than it looks on a diagram.
+
+On rate limiting, the point I would make is that limiting LLM endpoints by request count is meaningless, because one request can cost a thousand times another. Budgeting tokens rather than calls is what actually protects the bill.
+@followup
+Where do you store the refresh token on the client, and why?
+@answer
+An httpOnly, Secure, SameSite cookie scoped to the refresh path, so JavaScript cannot read it and XSS cannot exfiltrate it directly. Local storage is readable by any script on the page, which makes a single XSS a permanent account takeover. The cookie scoping matters — it is sent only to the refresh endpoint, not attached to every API call — and because it is a cookie I need CSRF protection on that endpoint, which SameSite plus a double-submit token handles. On mobile it goes in the platform keystore, Keychain or EncryptedSharedPreferences, not AsyncStorage.
+@red
+- Rotation without reuse detection — that is just a shorter-lived token.
+- Revoking only the reused token instead of the family.
+- Refresh tokens in local storage.
+- Fixed-window rate limiting presented as equivalent to sliding-window.
+
+### "Wrote end-to-end Playwright tests for multi-user editing, reconnection and conflict resolution" — how do you test a system whose whole point is concurrency?
+@short
+With multiple independent browser contexts in one test, driven deterministically. Playwright gives each user a separate context with its own storage and its own socket, so two real clients edit the same document in the same test. The hard part is not opening two browsers — it is asserting convergence without sleeping, so every assertion polls until both documents agree rather than waiting a fixed time and hoping.
+@deep
+Network conditions are the interesting cases and they have to be simulated deliberately: CDP lets me take a client offline mid-edit, let it accumulate local changes, then bring it back and assert that both sides converge on the same text.
+
+The assertion that matters is not "user B sees user A's text" — it is that both users' documents are byte-identical after the dust settles, in both directions, including the case where the edits overlapped at the same position.
+@code text Two real clients, one document, no sleeps
+  test('offline edits converge on reconnect', async ({ browser }) => {
+    const a = await browser.newContext();   // separate storage, separate socket
+    const b = await browser.newContext();
+    const pa = await a.newPage(), pb = await b.newPage();
+
+    await pa.goto(DOC); await pb.goto(DOC);
+    await expect(pa.locator('.peer-count')).toHaveText('2');   // real barrier
+
+    await pa.locator('#editor').type('Hello ');
+    await expect(pb.locator('#editor')).toHaveText('Hello ');  // A → B
+
+    await a.setOffline(true);                 // ── partition ──
+    await pa.locator('#editor').type('from A');   // queued locally
+    await pb.locator('#editor').type('from B');   // committed by server
+
+    await a.setOffline(false);                // ── heal ──
+
+    await expect.poll(async () =>             // convergence, not equality-now
+      await pa.locator('#editor').innerText()
+      === await pb.locator('#editor').innerText(),
+      { timeout: 10_000 }
+    ).toBe(true);
+  });
+
+  THE RULES THAT KEEP IT NON-FLAKY
+   ✔ never waitForTimeout — poll on the condition itself
+   ✔ barrier on peer-count before editing (both sockets actually joined)
+   ✔ assert CONVERGENCE (a === b), never a hard-coded expected string —
+     with concurrent inserts at one position, both orderings are CORRECT
+   ✔ one document id per test, generated per run → tests are parallel-safe
+   ✘ asserting "Hello from Afrom B" — that bakes in one valid interleaving
+@end
+@senior
+The insight I would lead with is that the correctness property of a CRDT system is convergence, not a specific output — so a test asserting an exact final string is asserting something the system never promised, and it will fail intermittently the moment timing shifts. That distinction is what makes these tests stable, and getting it wrong is why most people conclude real-time systems "cannot be tested reliably".
+
+The second is scope. End-to-end tests are slow and I keep few of them: the merge semantics themselves are unit-tested against the CRDT directly, where I can drive thousands of randomised concurrent operation sequences in milliseconds and assert convergence. Playwright covers the wiring — sockets, auth, reconnection, presence — which is exactly the layer unit tests cannot reach.
+@followup
+How do you keep these from being flaky in CI?
+@answer
+By removing every implicit wait. Explicit barriers on observable state rather than sleeps, polling assertions with a generous timeout, a unique document per test so runs never share state, and the whole stack — app, Postgres, Redis — brought up by Docker Compose in CI so timing is consistent. When one does flake, I treat it as a real bug until proven otherwise, because in a distributed system an intermittent test failure is usually an intermittent product failure that the user will eventually hit. Retries hide exactly the class of bug these tests exist to find, so I record them rather than silently passing on the second attempt.
+@red
+- A single browser context with two tabs — shared storage, not two real users.
+- waitForTimeout as the synchronisation mechanism.
+- Asserting one specific interleaving as the correct merge result.
+- Auto-retrying flaky real-time tests until green.
+
+### Your degree is a BBA, not computer science. How did you get here, and what are the gaps?
+@short
+I came to engineering through building things, and I closed the theory gap deliberately rather than hoping it would not come up. The practical answer is three years of production work — REST APIs, relational schema design, payments, containerised deployment — plus self-directed study of the fundamentals a CS degree gives you: data structures and complexity, operating-system concepts like scheduling and memory, networking from TCP up, and database internals. I would rather you test me on those than take my word for it.
+@deep
+The honest framing is that the degree is not the qualification; it is a proxy for the qualification, and I can be assessed directly. What a CS degree reliably provides is vocabulary and the theory underneath — complexity analysis, concurrency primitives, how a database actually stores and finds a row, how memory and scheduling work. Those matter, and I have deliberately learned them because not knowing them shows up quickly in senior interviews and in production: you cannot reason about an index without understanding B-trees, or about the event loop without understanding scheduling and I/O.
+
+What a business degree gave me that I do use is not decorative. I read a requirement and ask what it costs and who it is for before I ask how to build it, I am comfortable arguing an engineering trade-off in terms a product owner can act on, and I write and present clearly — which is most of what a senior engineer's day actually consists of.
+
+The thing I would not do is be defensive about it. A candidate who is uncomfortable with this question invites more of it; a candidate who answers it in thirty seconds with evidence and moves on ends it.
+@code text How I would close the question, concretely
+  THE ANSWER SHAPE
+    1. Where I actually came from, in one sentence — no apology.
+    2. The gap, named honestly, and what I did about it — specifically.
+    3. An invitation to test it, which only a confident answer can offer.
+    4. What the non-CS background gives me that is genuinely useful.
+
+  EVIDENCE I CAN POINT AT, NOT CLAIM
+    complexity/DSA    "the N+1 fix was recognising an O(n x m) loop —
+                       I build the index map instead, that is the habit"
+    OS / scheduling   event loop phases, libuv thread pool, why a CPU-bound
+                       handler blocks every other request on that process
+    networking        TCP handshake, TLS, keep-alive, why HTTP/2 changed
+                       bundling advice, head-of-line blocking
+    DB internals      B+tree structure, why a covering index avoids the
+                       row lookup, MVCC, isolation levels and what each permits
+    distributed       CAP as a trade you make per-operation, idempotency,
+                       at-least-once delivery, the reasons exactly-once is a lie
+
+  WHAT I DO NOT SAY
+    "the degree does not matter"      -> dismissive, and untrue in their eyes
+    "I am basically self-taught"      -> undersells three years of production work
+    a long story about switching      -> the question deserves 30 seconds
+@end
+@senior
+The senior version of this answer inverts the question. A hiring manager asking it is not checking a credential — they are checking whether there is a hole in the fundamentals that will surface at staff level, and whether I am self-aware about my own gaps. So I answer the real question: here is what I know because I needed it in production, here is what I studied deliberately because I would not otherwise have met it, and here is where I am still weaker than someone who has done it for a decade. Naming a genuine remaining gap — for me, formal distributed-systems theory beyond the practical patterns, and low-level performance work like profiling native code — is what makes the rest of the answer believable. Every candidate has gaps; the difference between mid and senior is knowing which ones you have. And I would let three years of shipped, running, operated systems do most of the arguing, because a degree predicts an entry-level hire and production track record predicts everything after that.
+@followup
+How do you keep learning, given you did not learn this formally?
+@answer
+Deliberately and with a bias toward building, because reading about a distributed system and operating one produce different knowledge. Concretely, the self-initiated projects on my CV are how I learn the things my day job does not reach — Golang and Clean Architecture in one, RAG and vector retrieval in another, CRDTs and WebSocket fan-out in the third — and each of those exists because I wanted to understand something properly rather than have an opinion about it. Alongside that I read primary sources over blog posts: the Postgres and MySQL documentation, the Node and libuv internals, papers when a topic warrants it. And the most reliable teacher has been production incidents — the things I understand best are the ones that broke at an inconvenient hour and made me read the manual properly.
+@red
+- Being defensive or apologetic about the degree.
+- Dismissing the value of CS fundamentals.
+- Claiming no gaps at all.
+- A long biographical story instead of a thirty-second answer with evidence.
+
+### You have three years of experience and you are interviewing for a senior role. Why should we consider you at that level?
+@short
+Because level is about scope of ownership and quality of judgement, not time served — and I would rather be measured on that than argue about the number. What I can point to is end-to-end ownership of production systems: I designed the schemas, built and operate the APIs, integrated the payment providers and own their failure modes, deployed and monitor the infrastructure, and I am the person paged when it breaks. Where I am genuinely less experienced than a ten-year engineer is breadth of scale and having mentored a team, and I would say so rather than oversell.
+@deep
+The strongest form of this answer is specific and unbothered. Three years at a company where I owned systems outright is a different three years from three years on a large team writing tickets within someone else's architecture — and that is the actual argument, not the number. Payments in particular is a domain where the responsibility is real: money moves, and getting idempotency or reconciliation wrong is not a bug report, it is a customer who was charged twice.
+
+The mistake candidates make is either apologising for the number or bluffing past it. Both lose. The interviewer already read the dates; the question is whether I can locate myself accurately, because a candidate who over-claims their level is a hiring risk regardless of ability.
+
+I would also make the practical point that I am not asking to be paid for a title. I am asking to be assessed on the work, and if the outcome is that I am strong mid rather than senior, that is a fair result from a fair process — which is a much more persuasive position than insisting on a label.
+@code text Level as scope, argued with evidence rather than years
+  WHAT I CAN EVIDENCE                              WHAT IT DEMONSTRATES
+  designed the schema, migrations, indexes         ownership of the data model
+  built AND operate 40+ endpoints in production    it does not end at merge
+  payments across three providers, webhooks,       correctness under partial
+    idempotency, reconciliation                      failure, real consequences
+  deploy, monitoring, on-call for what I built     production responsibility
+  a JS -> TS migration run alongside features      sequencing risk, not a rewrite
+  chose NOT to cache a slow query; fixed it        judgement, and knowing why
+  chose NOT to use Kubernetes on one VPS           judgement about cost, not tools
+
+  WHERE I AM HONESTLY NOT THERE YET
+    scale        I have operated thousands of transactions a month, not millions
+                 per day. I know the patterns; I have not been forced to prove
+                 them at that volume, and pretending otherwise fails at follow-up.
+    people       I have reviewed code and onboarded engineers; I have not led a
+                 team or owned a roadmap.
+    breadth      one primary production stack, deeply — not five, shallowly.
+
+  THE ASK        assess me on the work. If that lands at mid, that is a fair
+                 outcome. Arguing about the label is a losing position; being
+                 accurate about my own level is the senior signal itself.
+@end
+@senior
+The senior behaviour here is calibration, and the question is really testing for it. An engineer who claims to be senior at three years without qualification tells the interviewer their self-assessment is unreliable, which is a worse signal than being mid. So the answer that works names the specific dimensions where I do operate at a senior level — ownership through production, judgement about what not to build, systems whose failure modes I can enumerate from memory because I have handled them — and names the dimensions where I do not, without hedging the whole thing into mush. I would also reframe the risk from their side, because that is what they are actually weighing: the risk in hiring me is scale exposure and team leadership, and both are addressable in a role with senior engineers around me. The risk in hiring an over-claiming candidate is discovering the gap after they have designed something. Making that comparison explicitly is a more useful answer than a list of my achievements.
+@followup
+What would you need in order to operate at senior level here?
+@answer
+Context first, and quickly — the domain, why the architecture is the way it is, and where the known pain is, because most bad senior decisions come from someone confidently changing a system they do not yet understand. Beyond that, exposure to the scale I have not operated at, and engineers who are further along to review my design work seriously rather than approve it. I would expect to be genuinely useful within weeks on anything API, database or payments related because that is where my experience is concentrated, and to need longer before I would want to be the one making an architectural decision that is expensive to reverse. Saying that plainly is not a weakness in the answer — it is the answer.
+@red
+- Apologising for the number of years.
+- Claiming senior on every dimension.
+- Arguing about the title rather than the assessment.
+- Being unable to name a single genuine gap.
+
+### Your strongest projects are self-initiated with no users. Why should I weigh them?
+@short
+Weigh them for what they actually demonstrate and discount them for what they do not — and I will do that discounting myself before you have to. What they show is that I can design and build a Clean Architecture Go service, a CRDT-based collaboration server and a RAG pipeline from nothing, which is real engineering evidence. What they cannot show is behaviour under production traffic, real users doing unexpected things, or a system I have operated for two years and watched decay. My commercial work is where that evidence is, and I keep the two categories clearly separated on my CV for exactly that reason.
+@deep
+The distinction I hold to is between engineering skill and operational experience. A side project proves the first: the code exists, the architecture is a choice I made and can defend, and every trade-off in it was mine. It cannot prove the second, because nothing has ever been at 3am under load with a customer on the phone.
+
+So the framing that works is to be the one who says this. The label on my CV — self-initiated, self-hosted, no commercial users — is deliberate, and stating it before being asked converts a potential credibility problem into a credibility signal. An interviewer who discovers that a "platform" had no users is now doubting everything else on the page; an interviewer who was told upfront is not.
+
+What genuinely raises a project's evidentiary value is being able to discuss its limits as sharply as its features. I know what my WebSocket server does at ten thousand connections because I load-tested it, and I know which numbers I am inferring rather than measuring. I know the RAG numbers come from a 120-question golden set I built, not from user feedback. Being precise about the provenance of every number is the whole game.
+@code text How I present a project so it survives scrutiny
+  SAY THIS FIRST, UNPROMPTED
+    "These are self-initiated and self-hosted — no commercial users. What I
+     take from them is the design work; the operational experience is from
+     my day job."
+
+  WHAT THE PROJECT LEGITIMATELY EVIDENCES
+    architecture      Clean Architecture in Go, repository + service layers,
+                      dependency injection — a choice I can defend and would
+                      make differently now, which is the more interesting answer
+    unfamiliar tech   Go, GORM, CRDTs, pgvector — learned to a working depth
+    breadth           monorepo, Docker Compose, typed client, CI
+    judgement         what I deliberately left out, and why
+
+  WHAT IT DOES NOT EVIDENCE — and I say so
+    real traffic and real users doing things I did not anticipate
+    a two-year maintenance tail: dependency rot, schema drift, the feature
+      that made the original design wrong
+    incident response with consequences
+    working inside someone else's constraints and someone else's legacy code
+
+  THE NUMBERS RULE
+    every figure is labelled by provenance: measured / load-tested / estimated.
+    "10k concurrent connections on a 2-vCPU box, load-tested with k6, bound by
+     memory per connection" is credible.
+    "handles 10k concurrent users" is not, and invites the question that ends it.
+@end
+@senior
+The senior move is to volunteer the critique of my own project before the interviewer finds it, because that is what a design review actually sounds like. For the Go service I would say the Clean Architecture layering was heavier than a single-service codebase needed and I would collapse two layers if I rebuilt it — that is a more valuable thing to hear than a feature list, and it demonstrates that I evaluate my own work rather than defend it. I would also connect each project back to a real gap it was built to close, since a project with a stated purpose reads as deliberate learning while a project with no stated purpose reads as a portfolio exercise: the Go service exists because I wanted a statically typed, concurrent backend model to compare against Node, the collaboration platform because I wanted to understand why CRDTs are the answer to a problem that looks like it should be solved with locks. That framing turns "no users" from a weakness into evidence of how I learn.
+@followup
+Which of them would you rewrite, and how?
+@answer
+The IoT platform, and the change would be to reduce the architecture rather than extend it. I applied full Clean Architecture layering — entities, use cases, repository interfaces, transport — to a single service with one datastore, and the indirection cost more than it bought: a simple change touched four files, and the abstraction over the database was never used to swap databases because nobody ever swaps databases. I would keep the repository boundary because it makes testing genuinely easier, and collapse the use-case layer into the handlers until there was a second consumer to justify it. The broader lesson, which is the actual answer, is that architecture patterns are answers to specific pressures — team size, rate of change, multiple consumers — and applying them without the pressure present is a cost with no benefit. I learned that by building it and then living with it, which is the reason the project was worth doing.
+@red
+- Presenting a personal project as though it served real users.
+- Quoting a performance number without saying how it was obtained.
+- Being unable to criticise your own architecture.
+- Listing projects with no explanation of why each one exists.
+
+### Your work experience is MySQL but your projects are all PostgreSQL. Which do you actually know, and how do they differ?
+@short
+Both, at different depths and for different reasons. MySQL with InnoDB and Sequelize is where my production experience is — that is where I have designed schemas, tuned indexes off the slow query log, run online migrations and dealt with replication lag. PostgreSQL is where my self-directed work is, and it goes further into features MySQL does not have: pgvector for semantic search, richer JSON operations, partial and expression indexes. I would rather be precise about which experience is production and which is project than blur them together.
+@deep
+The differences that actually matter in an interview are architectural, not a feature checklist. The first is clustering: InnoDB stores rows inside the primary-key B+tree, so the primary key is physically the table and every secondary index stores the primary key rather than a row pointer. That has real consequences — a random primary key like a UUIDv4 causes page splits and index fragmentation on insert, and a secondary index lookup costs two traversals unless the index covers the query. PostgreSQL stores rows in an unordered heap with all indexes pointing at a tuple id, so index-only scans depend on the visibility map instead.
+
+The second is MVCC and how each handles dead rows. PostgreSQL writes a new row version on update and leaves the old one for `VACUUM` to reclaim, which is why bloat and autovacuum tuning are operational concerns and why transaction ID wraparound exists at all. InnoDB keeps old versions in the undo log rather than in the table, so it does not bloat the same way — but a long-running transaction pins the undo log and causes its own problems.
+
+The third is what each gives you at the query level. PostgreSQL has the stronger feature set — partial indexes, expression indexes, `FILTER`, real `MATERIALIZED VIEW`s, `CREATE INDEX CONCURRENTLY`, and extensions like pgvector, which is precisely why my vector work is there. MySQL 8 closed much of the gap with CTEs, window functions and instant DDL, and it remains excellent at high-concurrency simple reads.
+@code sql The differences I would actually be asked about
+-- 1. CLUSTERED (InnoDB) vs HEAP (Postgres)
+--    InnoDB: the table IS the primary-key B+tree.
+--            secondary index leaf -> PRIMARY KEY -> second traversal to the row
+--    => insert order matters enormously:
+CREATE TABLE events (id BINARY(16) PRIMARY KEY, ...);   -- UUIDv4 = random inserts
+                                                        -- = page splits, fragmentation
+CREATE TABLE events (id BIGINT AUTO_INCREMENT PRIMARY KEY, uuid BINARY(16) UNIQUE);
+                                                        -- sequential PK, UUID as a
+                                                        -- secondary key. Or UUIDv7.
+--    => covering indexes matter more in InnoDB, because they remove the second hop.
+--    Postgres: heap + tuple ids. Insert order does not fragment indexes the same way,
+--    but index-only scans need the visibility map to be current (i.e. vacuumed).
+
+-- 2. MVCC AND DEAD ROWS
+--    Postgres  UPDATE writes a new tuple; the old one is dead until VACUUM.
+--              -> table bloat, autovacuum tuning, XID wraparound.
+--    InnoDB    old versions go to the UNDO LOG, not the table.
+--              -> no bloat in the same way, BUT a long transaction pins undo
+--                 (history list length grows) and degrades everything.
+
+-- 3. ONLINE DDL
+--    Postgres  CREATE INDEX CONCURRENTLY (no write lock, two table passes)
+--    MySQL 8   ALTER TABLE ... ALGORITHM=INPLACE, LOCK=NONE
+--              ALGORITHM=INSTANT for adding a nullable trailing column
+--              -> but a long SELECT blocks the metadata lock, and everything
+--                 queues behind the blocked ALTER. Set lock_wait_timeout low.
+
+-- 4. FEATURES I USE POSTGRES FOR
+--    partial index      CREATE INDEX ON orders (created_at) WHERE status='pending';
+--    expression index   CREATE INDEX ON users (lower(email));
+--    pgvector           embedding vector(1536) + HNSW  -- no MySQL equivalent
+--    MySQL 8 equivalents: a functional index covers case 2; there is no partial
+--    index, so the usual workaround is a generated column plus an index on it.
+
+-- 5. THE DEFAULT THAT BITES
+--    MySQL utf8 is NOT UTF-8 (3 bytes, no emoji) -> always utf8mb4.
+--    MySQL default isolation is REPEATABLE READ; Postgres is READ COMMITTED.
+--    Same code, different concurrency behaviour, and it is not obvious.
+@end
+@senior
+The point I would make is that the transferable part is the model, not the syntax. Indexing strategy, understanding a query plan, knowing why a filesort or a full scan appeared, isolation levels and what anomalies each one permits, connection pooling, replication lag and read-after-write consistency — those are the same skills on both engines, and they are what actually determines whether someone can fix a slow API. The engine-specific knowledge is a layer on top, and it is learnable in weeks by someone who has the model, while the reverse is not true. The default isolation level difference is the one I would raise unprompted as evidence that I know where the traps are: the same application code on MySQL's REPEATABLE READ and Postgres' READ COMMITTED behaves differently under concurrent updates, and that is the kind of thing that produces a bug you cannot reproduce locally. And I would be careful never to answer a MySQL question in Postgres syntax — quoting `CREATE INDEX CONCURRENTLY` for work I did on MySQL would tell the interviewer I had rehearsed an answer rather than done the work.
+@followup
+You are starting a new service today. Which do you choose?
+@answer
+PostgreSQL, unless something specific argues otherwise — and the reasoning matters more than the answer. It has the richer feature set for the things that tend to appear later: partial and expression indexes, strong JSONB, `FILTER` and window functions, real materialised views, and the extension ecosystem including pgvector if anything in the product goes near semantic search. Its constraint and type system is stricter, which catches data problems at the database rather than in application code. I would choose MySQL where the team already runs it and has the operational knowledge, because operational familiarity beats a feature list every time, or where I am inheriting an ecosystem built around it. What I would not do is present this as a strong opinion: for the overwhelming majority of applications either engine is entirely adequate, and the schema design, the indexes and the query patterns will determine performance far more than the choice between them.
+@red
+- Blurring project experience and production experience together.
+- Answering a MySQL question with PostgreSQL syntax.
+- Treating the choice as a religious one.
+- Not knowing that MySQL and Postgres default to different isolation levels.
+
+### You list Golang and Python, but your production work is all Node. How strong are they really?
+@short
+Honestly: Node and TypeScript are my production languages, and Go and Python are working proficiency from self-directed projects — I would say that in exactly those words. In Go I built a full backend on Clean Architecture with Gin, GORM and Postgres, so I am comfortable with the language, the standard library, goroutines and channels, and idiomatic error handling; what I have not done is operate a Go service in production or debug one under load. Python is data-pipeline and FastAPI work: ingestion, chunking, embedding generation. I would rather be assessed accurately than have you discover the limit in a follow-up.
+@deep
+The reason to state the limit first is that the follow-up question always finds it. If I present Go as a production language, the next question is about the memory model, the race detector or how I have tuned garbage collection under load, and the gap surfaces at the worst possible moment. Stating it upfront costs nothing and makes everything else I claim more credible.
+
+What I can genuinely discuss is what the project forced me to learn: goroutines and channels as a concurrency model, `context` for cancellation and deadlines threaded through every layer, explicit error returns with wrapping, interfaces satisfied implicitly, and how that changes architecture — Go's implicit interfaces make dependency inversion so natural that Clean Architecture feels less bureaucratic there than in TypeScript.
+
+The comparison question is the one actually being asked most of the time, and it is a good one. Go and Node solve concurrency differently: Node gives one thread and an event loop, which is excellent for I/O-bound work and pathological for CPU-bound work because a single slow handler blocks every other request on that process. Go gives real parallelism across cores with cheap goroutines, so CPU-bound work does not stall the server — at the cost of actual shared memory and therefore actual data races, which is why the race detector exists and why Node's single-threaded model eliminates a whole class of bug for free.
+@code go What the project taught me, and the limits I would name
+// CONCURRENCY MODEL — the comparison actually being asked about
+//   Node   1 thread + event loop. I/O-bound: excellent. CPU-bound: fatal,
+//          a 200ms JSON parse blocks every concurrent request on the process.
+//          Parallelism = cluster/worker_threads, i.e. separate heaps.
+//   Go     M goroutines over N OS threads. CPU-bound work runs in parallel.
+//          Cost: real shared memory, therefore real data races.
+
+func (s *DeviceService) Ingest(ctx context.Context, batch []Reading) error {
+    g, ctx := errgroup.WithContext(ctx)   // cancels siblings on first error
+    sem := make(chan struct{}, 8)          // bounded — unbounded goroutines are
+                                           // the Go equivalent of an unbounded queue
+    for _, r := range batch {
+        r := r                             // pre-1.22: loop var capture. A real bug.
+        g.Go(func() error {
+            sem <- struct{}{}; defer func(){ <-sem }()
+            if err := s.repo.Save(ctx, r); err != nil {
+                return fmt.Errorf("save reading %s: %w", r.ID, err)  // %w wraps
+            }
+            return nil
+        })
+    }
+    return g.Wait()
+}
+
+// ctx is threaded through EVERY layer: cancellation, deadline, request scope.
+// It is the discipline Node's AsyncLocalStorage approximates less cleanly.
+
+// WHAT I HAVE ACTUALLY DONE
+//   Gin routing + middleware, GORM, Postgres, Redis, Docker Compose
+//   Clean Architecture: implicit interfaces make dependency inversion natural
+//   table-driven tests, go test -race in CI
+//
+// WHAT I HAVE NOT DONE — and I say so before being asked
+//   run a Go service in production, or debug one under real load
+//   pprof-driven optimisation of a live service
+//   GOGC / GOMEMLIMIT tuning against real allocation pressure
+//   diagnosed a goroutine leak from production metrics rather than a test
+@end
+@senior
+The senior framing is that language is the cheapest thing to acquire and the least interesting thing about a candidate. What transfers between them is everything that actually takes years: how to design an API, how to model data, how to reason about concurrency and failure, how to find out why a system is slow. I have written enough Go to know what it is good at and what it costs, and I would be productive in a Go codebase quickly — but I would not claim to be the person who tunes its garbage collector in month one, and a team that needs that today should hire for it. What I would offer instead is the honest trade: if the role is Go-primary, my ramp is real but measured in weeks rather than months, and everything I bring about systems and production discipline arrives on day one. That is a proposition an interviewer can actually evaluate, which is more useful to them than a claim they have to test.
+@followup
+When would you choose Go over Node for a service?
+@answer
+When the work is CPU-bound or the concurrency is high and long-lived, because those are exactly where Node's single thread stops being an advantage — image and video processing, heavy serialisation, cryptographic work, or a service holding a very large number of concurrent connections where memory per connection dominates. Go also has a real deployment advantage: a single static binary with no runtime to install, which matters for CLIs, sidecars and constrained environments. I would stay on Node where the work is I/O-bound request-response, where the team is already TypeScript and shares types with the frontend, or where the ecosystem for the specific problem is stronger — which for anything touching the web platform it usually is. And I would be clear that for a typical CRUD API neither choice is wrong, so the real inputs are what the team already operates and what they can maintain at 3am, not a benchmark.
+@red
+- Claiming production experience in a language you have only used in projects.
+- Reciting a language comparison with no experience behind it.
+- Not knowing why Node's single thread is both the feature and the limitation.
 
 ### Tell me about a production incident you caused or resolved.
 @short

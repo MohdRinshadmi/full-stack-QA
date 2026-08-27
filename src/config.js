@@ -1,10 +1,10 @@
 module.exports = {
   title: 'Senior Full-Stack Engineer — Interview Master Bank',
-  owner: 'Abdul Majeed',
+  owner: 'Mohammed Rinshad M I',
   role: 'Senior Full-Stack Engineer',
   year: '2026',
   out: __dirname + '/../build/master.html',
-  stack: ['React','Next.js','React Native','TypeScript','Node.js','Express','Golang / Gin','PostgreSQL','MySQL','MongoDB','Redis','AWS','Docker','CI/CD','Stripe · PayPal · Razorpay','RAG / LLMs','pgvector','WebSockets · Yjs','Clean Architecture','Testing'],
+  stack: ['React','Next.js','React Native','TypeScript','Node.js','Express','Python','Golang / Gin','MySQL · Sequelize','PostgreSQL','MongoDB','Redis','AWS','Docker','Nginx · PM2','CI/CD','Stripe · PayPal · Razorpay','RAG / LLMs','pgvector','WebSockets · Yjs','Clean Architecture','Testing'],
   parts: [
     { n:1, file:'src/parts/part1.txt', title:'Fundamentals', level:'Beginner → Early-mid',
       sub:'Everything a senior engineer must be able to answer instantly, without thinking. The answers are written so you sound senior even on a "basic" question.' },

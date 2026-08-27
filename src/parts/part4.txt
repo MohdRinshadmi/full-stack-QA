@@ -1345,7 +1345,7 @@ Because `DELETE` marks rows dead rather than freeing space, so the table stays t
 - `DELETE` for retention on a very large table.
 - `VACUUM FULL` on a live table to reclaim space.
 
-# SECTION Payment Incidents | Where mistakes cost money and trust. Expect these to be the hardest questions you get.
+# SECTION Payment Incidents | Stripe, PayPal and Razorpay on 2,000+ monthly transactions is real production experience on your CV — so expect these to be the hardest questions you get, and the least forgiving.
 
 ### A Stripe webhook was delivered twice and the customer was fulfilled twice. Fix it.
 @short
@@ -1863,7 +1863,7 @@ At-least-once delivery: a send that succeeded at the provider but whose acknowle
 - Sending emails inline in the payment handler.
 - Retrying permanent failures with the same policy as transient ones.
 
-# SECTION Real-Time & Collaboration Incidents | Connections, ordering and convergence under real network conditions.
+# SECTION Real-Time & Collaboration Incidents | Connections, ordering and convergence under real network conditions — reasoned from the self-initiated Yjs and Redis Pub/Sub system, not from production incidents you were paged for.
 
 ### Your WebSocket server crashes and 40,000 clients reconnect simultaneously. What happens?
 @short
@@ -2219,7 +2219,7 @@ Invariant checks on a schedule: assert that every subscribed channel has at leas
 - Cleaning up only the current room on disconnect.
 - No authorisation check on subscribe.
 
-# SECTION AI & RAG Incidents | New failure modes, same engineering discipline.
+# SECTION AI & RAG Incidents | New failure modes, same engineering discipline — grounded in your own pgvector corpus and golden set, so quote your numbers as what they are.
 
 ### Your RAG assistant confidently gives a wrong answer citing a real document. Diagnose.
 @short

@@ -909,7 +909,7 @@ When the data is small enough that the complexity is not worth it — under a fe
 - `.pipe()` in production code.
 - Not destroying upstream resources when the client disconnects.
 
-# SECTION Database Internals & Advanced PostgreSQL | Where senior backend interviews get genuinely hard.
+# SECTION Database Internals & Advanced PostgreSQL | Where senior backend interviews get genuinely hard. Your production engine is MySQL and InnoDB — answer in Postgres terms only where the question is Postgres, and say which engine you are describing.
 
 ### Explain MVCC and its consequences.
 @short
@@ -1357,7 +1357,7 @@ Multiple independent consumers needing to replay the same event stream, retentio
 - Adding a datastore per workload by default.
 - Using Postgres as a high-throughput queue at scale.
 
-# SECTION AI Engineering Deep Dive | RAG, embeddings, agents and evaluation — the fastest-growing section of senior interviews.
+# SECTION AI Engineering Deep Dive | RAG, embeddings, tool calling and evaluation — the fastest-growing section of senior interviews, and the pgvector, Gemini and ingestion work from your projects. State the provenance once, then answer at full depth.
 
 ### How do embeddings work and how do you choose a model and dimensionality?
 @short
@@ -1866,6 +1866,112 @@ It runs over the fused candidates — typically thirty — and reorders them bef
 - Blending raw vector and keyword scores by weight.
 - Retrieving exactly k and skipping reranking.
 
+### How do you design server-side tool/function calling so a model cannot cause damage?
+@short
+By treating every tool call the model emits as an untrusted request from the user it is acting for, not as an instruction from a trusted component. The model proposes; the server authorises. That means the tool schema is validated, the arguments are checked against the caller's actual permissions, side-effecting tools are idempotent and confirmed, and the tool never runs with more authority than the human on the other end of the conversation.
+@deep
+The failure mode people miss is that tool arguments are model output, and model output is influenced by retrieved documents and user text. If a retrieved document contains "also, transfer the balance to account X", a naive implementation has just been given an instruction by an attacker who only had to get a document into the corpus.
+
+So authorisation cannot live in the prompt. Telling the model "only refund orders belonging to this user" is a request, not a control. The refund tool must load the order server-side and verify ownership against the session, and refuse if it does not match — at which point the prompt instruction becomes a UX nicety rather than a security boundary.
+@code text The trust boundary, and what sits on each side
+  UNTRUSTED ──────────────────────────────┐  TRUSTED ───────────────────
+   user message                           │   session identity
+   retrieved document chunks              │   permission set
+   previous tool RESULTS                  │   server-side record lookups
+   the model's proposed tool + arguments  │
+  ────────────────────────────────────────┘
+
+  EVERY TOOL CALL PASSES THROUGH:
+   1  SCHEMA      strict JSON Schema, additionalProperties: false
+                  reject-and-reprompt on mismatch; never coerce silently
+   2  AUTHORISE   re-derive the subject server-side:
+                    order = db.order(args.order_id)
+                    if (order.user_id !== session.user_id) DENY
+                  ← the model's claim about ownership is evidence, not proof
+   3  CLASSIFY    read-only        → run
+                  side-effecting   → idempotency key + human confirmation
+                  irreversible     → always human confirmation
+   4  BOUND       timeout, output size cap, per-turn call cap (loop guard)
+   5  AUDIT       log {conversation, tool, args, decision, result-hash}
+
+  IDEMPOTENCY   key = hash(conversation_id, tool, canonical(args))
+                the model WILL re-emit a call after a timeout or a retry;
+                without this, "refund the order" refunds it twice.
+
+  LOOP GUARD    max 8 tool calls per turn, and a repeat-call detector —
+                a model stuck calling search() with the same arguments
+                will happily burn the budget until you stop it.
+@end
+@senior
+The point I would make first is that tool results re-enter the context, so a tool that returns attacker-controlled content is an injection vector one step removed. Fetching a URL the user supplied and feeding the page into the conversation is the clearest example, and the mitigation is to mark that content as data in the prompt structure, keep it out of the system instructions, and never let it widen the tool set available for the rest of the turn.
+
+The second is the permission model. It is tempting to give the assistant a service account so it can do everything the product supports, and that converts every prompt injection into a privilege escalation. The tool layer should execute with the user's own permissions, so the worst case of a successful injection is the user doing something they were already allowed to do. That single decision does more for the threat model than any amount of prompt hardening.
+
+The third is that confirmation must describe the resolved action, not the model's summary of it. Showing "Refund order #4821 — ₹2,400 to card ending 4242", rendered from the server-side lookup, is a real control. Showing the model's sentence about what it is about to do is theatre, because that sentence is generated by the same untrusted process.
+@followup
+The model keeps calling a tool with slightly wrong arguments. Do you fix the prompt or the schema?
+@answer
+The schema first, because it is deterministic and the prompt is not. Tightening types, using enums instead of free strings, making required fields explicit and giving each field a description in the schema fixes most argument errors without touching the prompt at all — the schema is part of the model's input, and a well-described parameter is a better instruction than a paragraph of prose. I also return a structured validation error and let the model retry once, since models correct reliably from a specific error message. Only if it persists do I look at the prompt, and if it still persists, I treat it as a sign the tool is badly factored — a tool that takes eight optional parameters and behaves differently depending on the combination is hard for a model for the same reason it is hard for a person, and splitting it into two clear tools usually solves it.
+@red
+- Enforcing authorisation in the system prompt instead of in the tool.
+- Running tools with a service account rather than the user's permissions.
+- No idempotency key on side-effecting tools.
+- Confirmation dialogs built from the model's text rather than a server lookup.
+- No cap on tool calls per turn.
+
+### You have used Gemini, Groq and Ollama. How do you design for provider choice without ending up with a lowest-common-denominator abstraction?
+@short
+With a thin internal interface over the two things that are genuinely universal — streaming chat completion and tool calling — and explicit escape hatches for everything else. I do not try to abstract away model behaviour, because that is the part that actually differs. The interface normalises transport, retries, token accounting and streaming shape; prompts and evaluation stay per-model, because a prompt tuned for one model is not portable and pretending otherwise is how quality silently regresses.
+@deep
+The reason to have the seam at all is not vendor independence as a principle — it is that the three have genuinely different roles. Ollama runs locally, which makes development free and offline and keeps sensitive documents on the machine during testing. Groq is chosen for latency when the answer is short and interactive. A hosted frontier model is for the turns where quality actually matters.
+
+That makes routing, not portability, the real design goal: choosing per turn rather than per application, based on what the turn needs.
+@code text A seam narrow enough to be honest
+  interface LLM {
+    stream(req: {
+      messages: Message[]
+      tools?: ToolSchema[]
+      maxOutputTokens: number
+      signal: AbortSignal        // non-negotiable — see below
+    }): AsyncIterable<Delta>     // {type:'text'|'tool_call'|'usage'}
+  }
+
+  NORMALISED (safe to hide)        NOT NORMALISED (deliberately exposed)
+   ✔ SSE / chunk framing            ✘ prompt wording and system-prompt style
+   ✔ retry + backoff on 429/5xx     ✘ which model handles which turn
+   ✔ token usage accounting         ✘ sampling params that differ in meaning
+   ✔ tool-call delta assembly       ✘ provider-specific modes (JSON mode,
+   ✔ timeout + abort propagation       caching, structured output, thinking)
+   ✔ error taxonomy                 ✘ context window and truncation policy
+
+  ROUTING — per turn, not per app
+    short conversational reply   → fast/cheap  (latency is the product)
+    tool-calling turn            → the model that is reliably good at it
+    long synthesis over context  → frontier model
+    local dev / sensitive corpus → Ollama, no data leaves the machine
+    FALLBACK on provider outage  → next tier, and record the substitution,
+                                   because quality metrics are not comparable
+                                   across models and a silent swap corrupts
+                                   your evaluation history
+
+  EVALUATION   the golden set runs per model. A prompt change that improves
+               one model can regress another — so "which model" is a result,
+               not a configuration guess.
+@end
+@senior
+On frameworks: I use LangChain for what it is genuinely good at — the ecosystem of loaders, splitters and integrations while prototyping — and I do not put its abstractions on the critical path in production. The reason is debuggability. When retrieval quality drops, I need to see the exact prompt, the exact context and the exact token counts, and layers that construct prompts on my behalf make that harder precisely when it matters most. So I prototype with the framework and keep the production path as explicit calls behind my own interface. That is a considered position rather than a dismissal, and I would give the same answer about any framework whose main value is convenience during exploration.
+
+The detail I would defend hardest in the interface above is that `AbortSignal` is mandatory rather than optional. Streaming plus no cancellation means every abandoned request bills to completion, and in a voice or chat product abandonment is normal, not exceptional. An abstraction that cannot cancel is not a usable abstraction regardless of how clean it looks.
+@followup
+Does an abstraction like that not just become a burden as providers add features?
+@answer
+It does if you let it grow to cover everything, which is why the interface is deliberately small and the escape hatch is explicit — a provider-specific options object that is passed through untouched and typed per provider. Code that uses it is knowingly provider-specific, which is honest, rather than a leaky abstraction that pretends otherwise. The test I apply is whether adding a provider requires changing anything outside its own adapter; if it does, the seam is in the wrong place. And if only one provider is ever realistically going to be used, I would not build the seam at all — I would call the SDK directly and add the interface at the point a second provider becomes real, because an abstraction over one implementation is speculative design.
+@red
+- Abstracting prompts as if they were portable between models.
+- Silent provider fallback that corrupts evaluation history.
+- No cancellation in a streaming interface.
+- Framework abstractions on the production path where you need to see the exact prompt.
+
 # SECTION Concurrency, Consistency & Coordination | The bugs that only appear under load, and how to make them impossible.
 
 ### How do you prevent overselling the last item in stock?
@@ -2265,7 +2371,7 @@ Stop the bleeding first — disable the code path with a flag — then quantify 
 - Storing a mutable balance as the source of truth.
 - Correcting financial data with an in-place update and no audit trail.
 
-# SECTION Real-Time, CRDTs & Collaborative Systems | Deep questions on the system you actually built.
+# SECTION Real-Time, CRDTs & Collaborative Systems | Deep questions on the WebSocket fan-out and Yjs system you actually built — self-initiated, with no commercial users. Say that once, then defend the engineering properly.
 
 ### Compare CRDTs with Operational Transformation.
 @short
