@@ -5800,6 +5800,205 @@ Per-user and per-tenant quotas measured in tokens or in currency rather than in 
 - Letting the model's tool calls run with elevated privileges.
 - Relying on "ignore previous instructions" style prompt defences.
 
+### LangChain is on your CV. Do you build on a framework or write the pipeline yourself?
+@short
+I use LangChain for the parts where its ecosystem is genuinely a time-saver — document loaders, splitters, and integration glue while prototyping — and I do not put its abstractions on the critical path in production. The reason is debuggability: a RAG pipeline is about eight explicit steps, each of which I want to log, time, cache and test individually, and a chain hides exactly those seams.
+@deep
+The value a framework provides is front-loaded. On day one it saves you writing a PDF loader, a token-aware splitter, and four provider adapters, and that is real. By month three the questions you are asking are "why did this query retrieve that chunk", "which stage burned 400ms", and "can I replay last Tuesday's failing request against the new prompt" — and answering those means opening the abstraction anyway.
+
+The specific problem is that the useful production seams and the framework's abstraction boundaries are not in the same places. I want to intercept between retrieval and reranking, cache at the embedding call, and swap the generation model per tenant. A chain is a single call that does all of it, so the interception points become callbacks and subclasses rather than functions.
+
+So my split is: borrow the ecosystem, own the orchestration. Loaders and splitters are pure functions over documents with no runtime coupling, and they are worth taking. The pipeline itself is maybe two hundred lines of my own code, and it is the two hundred lines I most need to be able to read at 2am.
+@code ts The pipeline as explicit steps — each one loggable, timeable, testable
+// Not a chain. A function, where every stage is visible and independently testable.
+export async function answer(q: string, ctx: Ctx): Promise<Answer> {
+  const t = tracer.start('rag', { tenant: ctx.tenantId });
+
+  const query      = await t.step('rewrite',  () => rewriteForRetrieval(q, ctx.history));
+  const candidates = await t.step('retrieve', () => hybridSearch(query, ctx, { k: 60 }));
+  const chunks     = await t.step('rerank',   () => rerank(query, candidates, { k: 5 }));
+
+  if (!chunks.length) return refuse('no_relevant_context');   // ✅ an explicit branch,
+                                                              //    not a silent empty prompt
+  const out = await t.step('generate', () => generate(ANSWER_V7, { q, chunks }, {
+    model: ctx.model, signal: ctx.signal,
+  }));
+
+  t.end({ chunks: chunks.map(c => c.id), promptVersion: 'ANSWER_V7', tokens: out.usage });
+  return { text: out.text, citations: chunks.map(toCitation) };
+}
+
+// ✅ Borrowed from the ecosystem — no runtime coupling, pure input → output:
+//      loaders (pdf, docx, html), token-aware splitters, tokenizers
+// ❌ Not borrowed — this is where production questions get answered:
+//      orchestration, retry, caching, tracing, cost attribution, prompt versioning
+@end
+@senior
+The version-churn argument is worth making because it is concrete rather than aesthetic: LLM framework APIs have moved fast and broken things repeatedly, and taking a breaking upgrade to fix an unrelated bug is a bad position to be in for code that is on a revenue path. Owning two hundred lines is cheaper than owning that dependency risk.
+
+Where I would happily reverse this is agent orchestration with genuinely complex state — multi-step planning with branching, retries and human approval steps. Writing your own state machine there is real work with real bugs, and that is a case where a framework is earning its abstraction rather than just wrapping a fetch call. I would also say plainly that the framework debate matters far less than chunking and evaluation, so I would not let an interview spend ten minutes on it.
+@followup
+What do you use for prompt and pipeline observability?
+@answer
+Structured tracing over the same stack as everything else, rather than an AI-specific tool by default. Every stage emits a span with its duration, and the trace carries the retrieved chunk ids, the prompt version, token counts in and out, computed cost, the model, and the tenant. That makes "which chunks produced this answer" a query rather than an investigation, and it makes cost attribution per tenant a group-by instead of a spreadsheet. The one thing I would add on top is a store of the full request and response payloads with a short retention, because replaying real failing inputs against a changed prompt is the fastest debugging loop available — with the caveat that those payloads are user data and need the same retention and deletion rules as anything else.
+@red
+- "We use LangChain" as the whole architecture answer.
+- Chains so deeply nested you cannot say what was sent to the model.
+- Writing your own loaders and splitters to avoid a dependency that costs nothing.
+
+### Why `pgvector` and not a dedicated vector database?
+@short
+Because one datastore is dramatically simpler to operate than two, and Postgres already holds the documents, the tenants and the permissions the retrieval has to respect. `pgvector` keeps the vector and its metadata in the same transaction, so the index cannot drift from the source of truth. I would move to a dedicated store when the corpus outgrows what one machine can index in memory, and I would want the numbers before making that call.
+@deep
+The argument is mostly about joins and transactions rather than about vector math. Real retrieval is never pure similarity — it is similarity filtered by tenant, by document permissions, by date, by status, joined to metadata for display. In Postgres that is one query. Split across a vector store and a relational database it becomes two round trips plus reconciliation, and the classic bug appears immediately: the vector store still serves a document the relational database deleted, because the two writes were not atomic.
+
+Where dedicated stores genuinely win is scale and specialisation — distributed sharding beyond one machine, memory tiering so cold vectors sit on disk, and purpose-built features like built-in reranking. Those are real, and none of them matter at a corpus of thousands to a few million chunks, which is where most products actually live.
+
+The honest limit is memory. HNSW wants to be resident, so the index size versus available RAM is the number that decides this, and it is knowable in advance rather than a matter of opinion.
+@arch The decision, with the thresholds written down
+  DIMENSION            pgvector                    Dedicated (Pinecone/Qdrant/…)
+  ──────────────────────────────────────────────────────────────────────────────
+  operational cost     zero new services           a datastore to run, back up,
+                                                    monitor and pay for
+  metadata filtering   a SQL WHERE + join          per-product, often limited
+  transactional sync   ✅ same transaction         ✅ never — eventual, needs
+                        as the document write       reconciliation
+  permissions          RLS, same as everything     reimplemented in the app
+  backup / PITR        it is just Postgres         a second, separate story
+  scale ceiling        one machine's memory        shards horizontally
+  cold storage         all resident                memory tiering built in
+
+  MY THRESHOLD, stated as a number rather than a feeling:
+    index size ≈ rows × dims × 4 bytes × 1.4  (HNSW overhead)
+      2M chunks × 1536 dims → ~17 GB  → comfortable on one Postgres box
+     20M chunks × 1536 dims → ~172 GB → shrink it first (halfvec, 768-dim,
+                                         partial indexes), then reconsider
+@end
+@senior
+The framing I would use is that adding a datastore is not a feature decision, it is an operational commitment — backups, failover, an access-control model, a second consistency story, and one more thing that can be down at 3am. That cost is paid forever and is invisible in a benchmark, which is why "vector DB benchmarks faster" is not on its own a reason to adopt one.
+
+I would also point out that the migration path is not frightening, which lowers the stakes of choosing Postgres first. The retrieval layer is one interface — embed, upsert, search, delete — so swapping the implementation is contained if the day comes, and the embeddings themselves are portable. Starting with the simpler option and keeping the seam clean is strictly better than adopting the complex one on a forecast that may never arrive.
+@followup
+What would actually push you off `pgvector`?
+@answer
+Three things, in order of likelihood. First, index size exceeding what one instance can hold after I have already tried `halfvec`, dimension reduction and partial indexes — that is the real ceiling and it is arithmetic, not opinion. Second, index build time becoming operationally intolerable: if a full rebuild takes eight hours and I need to re-embed on a model change, that is a maintenance window I cannot get, and distributed builds solve it. Third, a workload where the vector traffic and the transactional traffic genuinely conflict for the same resources — a heavy write path competing with heavy ANN queries on one primary is a real contention problem, though a read replica solves the milder version of it. What would not push me off is a benchmark showing lower query latency in isolation, because at my scale both are comfortably under the budget and the difference is invisible next to the LLM call.
+@red
+- Adopting a vector database before measuring whether Postgres is a problem.
+- Two datastores with no reconciliation, so deleted documents keep being cited.
+- Reimplementing tenant permissions in application code because the vector store cannot join.
+
+### How do you keep the vector index in sync with the source of truth?
+@short
+By making the index a derived artefact with an explicit contract, not a second source of truth. Chunk changes are detected by content hash so only changed chunks are re-embedded, deletes are transactional with the document delete, and a periodic reconciliation job proves the two agree rather than assuming it. Every chunk carries the embedding model version, so a model change is a migration and not a corruption.
+@deep
+Three drift paths cause almost all of the bugs. Deletes that never reach the index, so a removed document keeps being cited — the worst one, because it is a compliance failure as well as a quality failure. Updates that re-embed the whole document, which is merely expensive, or that update the text and not the embedding, which is silent and much worse: retrieval matches on the old meaning and the model reads the new text. And model changes, where new and old embeddings coexist in one index and their distances are not comparable, so ranking degrades in a way that looks like a mysterious quality regression.
+
+The design that avoids all three is to treat the document row as authoritative and everything vector-shaped as rebuildable. Writes go to the document inside a transaction that also enqueues the reindex; a re-embedding failure retries against a job, so the index converges. A hash per chunk makes the common case — a typo fix in a 200-page document — cost one embedding call instead of four hundred.
+@code ts Content-hash diffing, transactional deletes, versioned embeddings
+export async function reindexDocument(docId: string) {
+  const doc = await db.documents.get(docId);
+  const chunks = chunkDocument(doc);
+  const existing = await db.chunks.byDoc(docId);            // id → contentHash
+  const seen = new Set<string>();
+
+  const toEmbed: Chunk[] = [];
+  for (const c of chunks) {
+    c.hash = sha256(c.embedText);
+    seen.add(c.hash);
+    const prev = existing.find(e => e.hash === c.hash);
+    if (prev && prev.model === EMBEDDING_MODEL) continue;   // ✅ unchanged: skip
+    toEmbed.push(c);                                        //    typo fix = 1 call, not 400
+  }
+
+  const vectors = await embedBatch(toEmbed.map(c => c.embedText));
+
+  await db.tx(async trx => {
+    // ✅ delete and insert in ONE transaction — retrieval never sees a half-updated doc
+    await trx.chunks.deleteWhere({ docId, hashNotIn: [...seen] });
+    await trx.chunks.upsert(toEmbed.map((c, i) => ({
+      ...c, embedding: vectors[i], model: EMBEDDING_MODEL, docId,
+    })));
+    await trx.documents.update(docId, { indexedAt: new Date(), indexVersion: doc.version });
+  });
+}
+
+// Deleting a document — the path that must never be best-effort:
+await db.tx(async trx => {
+  await trx.documents.delete(docId);
+  await trx.chunks.deleteWhere({ docId });      // same transaction, or it drifts
+  await trx.outbox.insert({ type: 'purge_caches', docId });   // semantic cache too
+});
+
+// Reconciliation, nightly — trust nothing, prove it:
+//   documents with indexVersion < version      → stale, enqueue reindex
+//   chunks whose docId no longer exists        → orphaned, delete and alert
+//   chunks with model != EMBEDDING_MODEL       → migration is incomplete
+@end
+@senior
+The point I would push is that the semantic cache is part of the index and is routinely forgotten. Delete a document, purge its chunks correctly, and a cached answer from yesterday still quotes it — so cache entries need to record which chunk ids produced them, and a chunk delete has to invalidate the answers derived from it. Without that, "we deleted the customer's data" is not true, and it is the kind of untrue that ends up in a compliance conversation.
+
+On model migration, the workable pattern is a second column rather than a rewrite in place: add `embedding_v2`, backfill it in the background while retrieval keeps using v1, compare both against the golden set, then cut over and drop the old column. It costs disk temporarily and it means the migration is reversible, which for something that takes hours to recompute is worth far more than the disk.
+@followup
+How do you reindex a large corpus without downtime or a huge bill?
+@answer
+As a background job with a resume point, not a script someone runs in a terminal. It reads in batches ordered by id, records progress durably so a crash resumes rather than restarts, and rate-limits itself against the embedding provider's quota so it does not starve live traffic — the ingestion path and the user-facing path compete for the same quota, and live traffic must win. Writing into a new column means retrieval keeps serving from the old one throughout, so there is no window where the index is half-migrated and results are incoherent. I would run it at low concurrency over days rather than at high concurrency over hours, because there is no deadline that justifies degrading production, and I would check the golden set against the new column before cutting over rather than after.
+@red
+- Best-effort deletes outside the transaction that removed the document.
+- Re-embedding whole documents on every edit.
+- Mixing embeddings from two models in one index.
+
+### How do you version and test prompts so a change cannot silently break production?
+@short
+Prompts are code: they live in the repository, they are versioned, they go through review, and every change runs against an evaluation set before it ships. The reason this matters more than it does for ordinary code is that a bad prompt change does not throw — it produces slightly worse answers, which nobody notices for weeks. So the safety net has to be a measurement, not an exception.
+@deep
+The failure mode is specific and it is what makes prompt work feel unserious to people who have only seen it done badly. Someone tweaks a sentence to fix one reported case, ships it, and accuracy on a different class of question drops by fifteen points. Nothing errors, no alert fires, and the regression is discovered from support tickets a fortnight later.
+
+Everything follows from that. The evaluation set is the test suite, and it grows the way a test suite grows — every production failure that gets fixed is added as a case, so it can never silently return. The prompt version is recorded on every generation, so an answer in the logs can be traced to the exact text that produced it. And meaningful changes go out behind a flag with a comparison rather than as a straight replacement, because offline evaluation catches regressions but does not tell you which version users prefer.
+
+I would also keep prompts out of the database, tempting as it is to make them editable. Once they are editable at runtime by anyone, they are outside review, outside the diff, and outside the deploy history — and the first hard incident is one nobody can reconstruct.
+@code ts Prompts as versioned artefacts, with a regression gate in CI
+// prompts/answer.ts — a normal reviewable, diffable module.
+export const ANSWER_V7 = {
+  version: 'answer@7',
+  text: `You answer strictly from the provided context.
+If the context does not contain the answer, say so — do not infer.
+Cite every claim as [doc_id:section].`,
+  changedFor: 'v6 over-inferred from partially relevant chunks (INC-412)',
+} as const;
+
+// evals/answer.eval.ts — the test suite. Grows with every production failure.
+const CASES = [
+  { q: 'refund window for enterprise?', mustCite: 'contract-12:Billing > Refunds',
+    mustContain: ['30 days'] },
+  { q: 'do you support SOC2?',          mustRefuse: true,      // ← not in the corpus
+    note: 'INC-412: v6 invented an answer here' },
+];
+
+test.each(CASES)('$q', async (c) => {
+  const out = await answer(c.q, testCtx);
+  if (c.mustRefuse) return expect(out.text).toMatch(REFUSAL);
+  expect(out.citations.map(x => x.id)).toContain(c.mustCite);
+  for (const s of c.mustContain ?? []) expect(out.text).toContain(s);
+});
+
+// CI gate — a prompt change that drops the aggregate score does not merge.
+//   deterministic assertions first (citations, refusals, JSON shape) — free and stable
+//   LLM-as-judge only for the subjective remainder — and the judge prompt is
+//   ALSO versioned, or your baseline moves under you
+@end
+@senior
+The distinction I would draw is between deterministic checks and judged ones, because teams often reach for an LLM judge for everything and end up with a noisy, expensive gate they stop trusting. Whether the right document was cited, whether the model refused when it should have, whether the JSON parsed, whether a forbidden phrase appeared — all of that is an assertion, it is free, it is stable, and it catches most real regressions. The judge is for the residue: tone, completeness, helpfulness. And the judge's own prompt has to be pinned, or your measuring instrument drifts and every historical score becomes incomparable.
+
+The organisational point is that this is what makes prompt engineering reviewable. Once a change is a diff with a score attached, a non-engineer can propose one and it goes through the same gate as everything else, which is the only version of "let the domain expert edit the prompt" that survives contact with production.
+@followup
+How large does the evaluation set need to be?
+@answer
+Smaller than people expect to be useful, and it matters far more that it is representative than that it is large. Fifty to a hundred cases drawn from real production queries — including the awkward ones, the ambiguous ones, and the ones where the correct answer is "I do not know" — will catch the large regressions, which are the ones that hurt. The most valuable cases are not the ones you write at the start; they are the ones added after each production failure, because those are by definition the mistakes your system actually makes rather than the ones you imagined. I would rather have eighty curated cases that someone maintains than a thousand generated ones nobody has read, because an eval set with wrong expected answers in it is worse than none — it trains you to ignore the gate.
+@red
+- Editing the production prompt directly to fix a single reported case.
+- Prompts stored in a database and edited at runtime, outside review and deploy history.
+- An LLM judge whose own prompt is unversioned, so the baseline drifts.
+
 # SECTION Frontend Build & Web Performance | The Create React App to Vite migration, Lighthouse 62 to 89, and every number you claim on your résumé.
 
 ### How exactly did you reduce build time by migrating to Vite?

@@ -2650,6 +2650,208 @@ It would move the problem rather than remove it — dedicated vector databases h
 - Assuming the ANN index is being used without checking the plan.
 - Leaving `ef_search` elevated after a tuning exercise.
 
+### Users say the voice assistant "takes forever and then talks over me". Diagnose both halves.
+@short
+Those are two different bugs that feel like one product. The delay is a serial pipeline — recording, then transcribing, then generating, then synthesising, each waiting for the last — and it is fixed by overlapping the stages. The talking over is endpointing and barge-in: it decides the user has finished when they merely paused, and it does not stop playback when they start speaking. I would measure time-to-first-audio, not total response time, because that is the number users actually experience.
+@deep
+Take the latency first, because it is measurable. Instrument each boundary separately — end of speech to final transcript, transcript to first token, first token to first audio out — and the serial pipeline shows up immediately as three fat sequential bars. Almost all of the fix is starting each stage on the first useful output of the previous one rather than on its completion: stream partial transcripts, start generation at the endpoint, and synthesise sentence by sentence instead of waiting for the full answer.
+
+The interruption half is worse because it is a state bug rather than a speed one. If endpointing fires on a fixed silence threshold, a user who pauses to think gets cut off mid-sentence, the assistant answers half a question, and it then keeps talking when they resume — which reads as rudeness rather than as a timing parameter. And when barge-in is missing, three streams keep running: audio playback, the token stream, and the new transcription, all at once.
+
+The subtle consequence is history corruption. If the response is written to the conversation as if it completed, the model believes the user heard things they did not, and every later turn is built on that false premise.
+@code ts What I would instrument, and what the fix looks like
+// STAGE 1 — find where the second actually goes. Per turn, per stage.
+turn.mark('speech_end');            // endpoint detected
+turn.mark('transcript_final');      // → 600ms means STT is not streaming
+turn.mark('first_token');           // → 900ms means retrieval is serial and cold
+turn.mark('first_audio');           // → 1100ms means TTS waited for the full answer
+// The metric that matters: speech_end → first_audio. Alert on p95 > 1s.
+
+// STAGE 2 — overlap. Sentence-level TTS is the single biggest win.
+let buffer = '';
+for await (const token of llm.stream(prompt, { signal: turn.signal })) {
+  buffer += token;
+  const [sentence, rest] = splitFirstSentence(buffer);
+  if (sentence) { tts.enqueue(sentence); buffer = rest; }   // ✅ speak while generating
+}
+if (buffer.trim()) tts.enqueue(buffer);
+
+// STAGE 3 — barge-in. One signal cancels everything, in this order.
+vad.on('speech_start', () => {
+  const spoken = audio.stopImmediately();     // stop mid-word; do not finish the sentence
+  turn.abort();                               // AbortController → kills the LLM stream,
+  tts.clear();                                //   which also stops the token spend
+  history.push({ role: 'assistant', content: spoken, truncated: true });
+  //                                  ↑ what was HEARD, not what was generated
+});
+
+// STAGE 4 — endpointing that is not a fixed threshold:
+//   silence 700ms + a syntactically complete utterance  → end the turn
+//   silence 700ms after "and the…", or a filler word    → wait, they are thinking
+//   hard cap at ~2.5s of silence regardless
+@end
+@senior
+The insight I would offer is that the perceptual budget is not uniform, so optimising average latency optimises the wrong thing. Users forgive two seconds before a long considered answer and do not forgive half a second of dead air before "yes" — silence with no signal is what reads as broken. Opening the audio channel or emitting a brief acknowledgement resets that clock, which means some of this is a product fix rather than an engineering one, and it is much cheaper than shaving 200ms off inference.
+
+On the interruption half, I would be explicit that it is a cancellation-correctness problem: three concurrent streams have to die in the right order and leave coherent state behind. Getting that wrong does not show up as an error, it shows up as an assistant that references things the user never heard, three turns later, which is the kind of bug that is nearly impossible to reproduce from a report unless you recorded what was actually spoken aloud.
+@followup
+The transcription is fine in the office and terrible on the customer's factory floor. What now?
+@answer
+Ambient noise, and it is an audio pipeline problem before it is a model problem. The first checks are the capture path — sample rate, mono versus stereo, whether the client is applying noise suppression and echo cancellation at all, and whether some devices are silently downsampling. Voice activity detection tuned for a quiet room will also treat machine noise as speech and never endpoint, so the assistant appears to hang. Beyond capture, a phrase-hint vocabulary seeded with that customer's terminology absorbs a lot of the remaining error, and push-to-talk is a legitimate answer for genuinely hostile environments rather than an admission of defeat. I would also make the pipeline tolerant of imperfect transcripts — hybrid retrieval still finds the right chunk when a product name is off by a character — and never let the model silently "correct" the transcript into something more plausible, because a confident answer to a misheard question is worse than a visible mistranscription the user can simply repeat.
+@red
+- Reporting average response time instead of time-to-first-audio.
+- No barge-in, or barge-in that lets the current sentence finish.
+- Writing the full generated response into history when playback was cut off.
+
+### A customer says a document they deleted last week is still being quoted in answers. Respond.
+@short
+Treat it as a data-handling incident, not a quality bug — the customer's statement is that deleted data is still being disclosed. Contain first by blocking that document id at the retrieval boundary so the next answer cannot include it, then find which of the three drift paths it took: the chunks, the semantic cache, or a stale replica. The reason it happened is that the delete was best-effort somewhere it needed to be transactional.
+@deep
+The index is a derived artefact, and derived artefacts drift when the write path is not atomic with the source of truth. The three places to look, in order: chunk rows that were never deleted because the delete ran outside the document's transaction and failed silently; cached answers that were generated before the delete and are still being served, because the cache was keyed on the question and knows nothing about chunk lifecycle; and a read replica or a warm application cache that has not caught up.
+
+The cache path is the one that is routinely missed and it is the most awkward to explain to a customer, because the document really is gone and the system really is still quoting it.
+
+Once contained, the question that matters is scope: was this one document, or is the delete path broken for everyone? A reconciliation query answers that in a minute, and the answer determines whether this is a customer email or a disclosure notification.
+@code sql Contain, then measure the blast radius
+-- 1. CONTAIN (minutes) — a deny list checked at retrieval, before anything else.
+--    Ugly, immediate, and it makes the next answer correct.
+INSERT INTO retrieval_blocklist (doc_id, reason) VALUES ($1, 'INC-518 delete drift');
+
+-- 2. SCOPE — is this one document or every document?
+SELECT count(*) AS orphaned_chunks
+  FROM chunks c LEFT JOIN documents d ON d.id = c.doc_id
+ WHERE d.id IS NULL;                              -- chunks whose document is gone
+
+SELECT count(*) FROM answer_cache ac
+ WHERE ac.chunk_ids && ARRAY(SELECT id FROM chunks WHERE doc_id = $1);
+--     ↑ requires the cache to record WHICH chunks produced each answer.
+--       If it does not, that is finding #1 and the cache must be flushed wholesale.
+
+-- 3. PURGE — chunks, cache entries derived from them, and any exported copies.
+DELETE FROM chunks WHERE doc_id = $1;
+DELETE FROM answer_cache WHERE chunk_ids && ARRAY[...];
+
+-- 4. PREVENT — one transaction, and an outbox so downstream purges cannot be skipped.
+BEGIN;
+  DELETE FROM documents WHERE id = $1;
+  DELETE FROM chunks    WHERE doc_id = $1;
+  INSERT INTO outbox (type, payload) VALUES ('purge_derived', jsonb_build_object('docId', $1));
+COMMIT;
+
+-- 5. DETECT — the nightly reconciliation that should have caught this before the customer did.
+--    orphaned chunks > 0 → page. This is a correctness invariant, not a metric.
+@end
+@senior
+The point I would make to the interviewer is that this is a compliance question wearing a quality bug's clothes. If the deletion was made under a data-protection request, "we deleted it from the primary table" is not deletion — the obligation covers derived copies, which means chunks, embeddings, cached answers, logs that captured the content, and any evaluation set someone built from production data. That last one catches teams out badly, because eval sets are copied into repositories and outlive everything.
+
+The engineering conclusion is that deletion needs to be a first-class path with a completeness test, not an afterthought — I would want an automated test that creates a document, deletes it, and then asserts it is unreachable through retrieval, through the cache, and through search, because that is the only way you find out the path is broken before a customer does.
+@followup
+The customer asks for proof that it is gone everywhere. What do you give them?
+@answer
+A written inventory of every place the content existed and the state of each, with timestamps — primary tables, chunk and embedding rows, cached answers, backups, logs, and any analytics export — plus the reconciliation query output showing zero remaining references. Backups are the honest complication and I would not hide it: they are immutable by design, so the truthful answer is that the data persists in encrypted backups until they age out on a stated retention schedule, and that restores are followed by a re-application of pending deletions. Customers accept that when it is stated plainly with a date attached, and they are entitled to be angry if they later discover it was glossed over. I would also tell them what the detection gap was and what now closes it, because the question behind the question is whether it can happen again.
+@red
+- Deleting the chunks and forgetting the semantic cache.
+- Treating it as a bug ticket rather than a potential data-handling incident.
+- Having no way to enumerate where derived copies of the content live.
+
+### Your agent called the same tool 47 times in one request and burned a month of budget in an afternoon. Contain it.
+@short
+Kill the loop first with a hard per-request step cap, which should have existed from the start, then find why it never terminated. It is almost always the model failing to recognise that a tool result answered its question — an empty result, an error string it cannot interpret, or a tool description that promises something the tool does not return — so it tries again with a slight variation forever. The budget half is a separate failure: cost limits belong per request and per tenant, enforced in the loop, not reviewed on a monthly invoice.
+@deep
+Agent loops are a `while` loop with a model deciding the exit condition, and that is exactly as dangerous as it sounds. Without an explicit bound, non-termination is a normal outcome rather than an exotic one.
+
+The most common trigger is an unhelpful tool result. A search tool that returns `[]` for a bad query tells the model nothing about *why*, so it rephrases and retries; an exception rendered as a stack trace is worse, because the model cannot act on it and often loops harder. The fix is that tool results are part of the prompt surface — an error should be a short, actionable sentence like "no results; the date filter must be ISO-8601" rather than a trace.
+
+The second trigger is a tool description that overstates the tool. If the description implies it can look up any customer and it can only look up active ones, the model will keep trying on the assumption it phrased the call wrong.
+
+Then there is the cost geometry, which is what turned this from a bug into an incident: each step resends the whole accumulated transcript, so token spend grows quadratically with step count. Step 40 is not the same price as step 4 — it is far more, which is why an unbounded loop empties a budget so fast.
+@code ts The bounds that should exist before an agent ships
+async function runAgent(task: string, ctx: Ctx) {
+  const budget = { steps: 0, maxSteps: 10, tokens: 0, maxTokens: 60_000,
+                   costCents: 0, maxCostCents: 50 };
+  const recent: string[] = [];
+
+  while (true) {
+    if (++budget.steps > budget.maxSteps) return escalate('step_limit', ctx);
+    if (budget.tokens > budget.maxTokens || budget.costCents > budget.maxCostCents)
+      return escalate('budget_limit', ctx);                  // ✅ fail closed, and TELL the user
+
+    const step = await model.next(ctx.transcript, TOOLS);
+    budget.tokens += step.usage.total;
+    budget.costCents += price(step.usage, ctx.model);
+
+    if (step.type === 'final') return step;
+
+    // ✅ Loop detection: the same call with the same args twice is not progress.
+    const sig = `${step.tool}:${stableHash(step.args)}`;
+    if (recent.includes(sig))
+      ctx.transcript.push(toolMsg(step, 'You already made this exact call and got the ' +
+        'result above. Use it, or answer that you cannot complete the task.'));
+    else ctx.transcript.push(toolMsg(step, await callTool(step, ctx)));
+    recent.push(sig);
+  }
+}
+
+// ✅ Tool results must be USABLE by a model, not by a developer:
+//   bad : throw new Error('ECONNREFUSED 10.0.3.4:5432')
+//   good: 'The orders service is unavailable. Do not retry; tell the user.'
+//   bad : []
+//   good: 'No orders found for that customer in the last 90 days. Widen the range?'
+@end
+@senior
+The observation I would lead with is that the cost was not the real damage — it was the least of it. An agent looping for 47 steps also hammered a downstream service 47 times, and if any of those tools had side effects, the incident is duplicated writes rather than a bill. That is why I separate tools into read and write classes and apply different rules: reads can be retried and are cheap to bound, writes are idempotent by key, capped hard, and where the action is consequential they require confirmation rather than autonomy.
+
+I would also say that "the model looped" is the symptom and rarely the root cause. In every instance I have reasoned through, the loop was the model responding sanely to a tool that gave it nothing to act on. Fixing the prompt to say "do not repeat calls" is the weakest available fix — it is a request, not a bound — whereas making tool errors informative fixes the actual cause, and the step cap ensures that when it fails anyway, it fails for one request instead of for the budget.
+@followup
+How would you have caught this before the invoice did?
+@answer
+Real-time spend tracking on the same path that spends the money, not a daily export. Every model call adds its computed cost to a per-request and per-tenant counter in Redis, with alerts on rate rather than on total — a tenant at ten times their trailing hourly average is worth waking someone for, whereas a monthly threshold only tells you afterwards. Step-count distribution is the leading indicator and it is cheap: agent runs should cluster at two or three steps, so a rising p99 approaching the cap means loops are starting to happen and the cap is currently the only thing containing them. I would alert on that p99 well before the cap, because by the time requests are hitting the ceiling the behaviour is already broken — the cap is a safety net, not a monitor.
+@red
+- An agent loop with no step, token or cost bound.
+- Tool errors returned as stack traces the model cannot act on.
+- Discovering cost problems from the monthly invoice.
+
+### Your LLM provider degrades for three hours — slow, then 503s. What did your users experience, and what should they have?
+@short
+What they experienced depends entirely on whether the timeouts were bounded. The bad version is requests hanging until the load balancer kills them at 60 seconds, Node's connection pool filling with stalled sockets, and the whole API becoming unavailable — an AI outage taking down endpoints that have nothing to do with AI. What they should experience is the AI feature failing fast and visibly while everything else keeps working, and where the request is retryable, a fallback provider serving a slightly worse answer instead of no answer.
+@deep
+The lesson is about blast radius rather than about AI. A slow dependency is more dangerous than a dead one, because a dead one fails immediately while a slow one holds resources. Without an aggressive timeout, in-flight requests accumulate, and whatever they share — the connection pool, the event loop, memory for buffered streams — becomes the choke point for unrelated traffic.
+
+So the containment is standard dependency hygiene applied to a dependency people forget to treat as one: a timeout shorter than the upstream's, a circuit breaker that stops sending traffic to something that is failing, and a bulkhead so AI requests cannot consume every slot.
+
+Failover is the part that is genuinely AI-specific and it is subtler than a retry, because providers are not interchangeable. Prompts tuned for one model behave differently on another, output schemas vary, and streaming formats differ. Failover you have never exercised is a hypothesis, and a degradation is a bad moment to test it.
+
+Streaming adds its own wrinkle: a stream that dies mid-answer has already sent tokens, so a naive retry duplicates text on the client. Either the client handles replacement explicitly, or the fallback is only for streams that failed before the first token.
+@arch The layered response, and what the user sees at each layer
+  LAYER            MECHANISM                          USER EXPERIENCE
+  ────────────────────────────────────────────────────────────────────────────
+  timeout          15s hard cap, well under the LB    fails fast, no hang
+  retry            once, jittered, ONLY on 5xx/429    invisible when it works
+  circuit breaker  open after 5 failures in 30s       instant, honest error
+                   half-open probe every 30s          auto-recovery, no deploy
+  fallback model   Groq/local, own prompt + eval      slower/simpler answer,
+                                                       labelled as degraded
+  bulkhead         AI calls capped at N concurrent    ✅ THE KEY ONE: checkout,
+                   with their own pool                 login and search unaffected
+  degraded mode    retrieval WITHOUT generation       "here are the 5 relevant
+                                                       passages" — still useful
+  queue            long jobs → async + notify         no user waiting at all
+
+  Non-negotiable: an AI provider outage must never make /login slow.
+@end
+@senior
+The answer I would give that separates a senior response is the degraded mode, because it changes the question from "how do we stay up" to "what is still valuable when the model is gone". In a RAG product, retrieval works perfectly well without the LLM — showing the five most relevant passages with their citations is genuinely useful, and it is a far better experience than an error page. That is an architectural payoff from keeping retrieval and generation as separate stages rather than as one chain, which is worth connecting back explicitly.
+
+On failover, I would be honest about a cost people gloss over: a second provider means a second prompt to maintain and a second evaluation run in CI, or the fallback silently rots. If the team cannot commit to that, a well-executed degraded mode is more reliable than a fallback nobody has tested, and I would rather say so than claim multi-provider resilience I could not demonstrate.
+@followup
+Your circuit breaker opened, but the provider was fine — it was your own network. How would you tell the difference?
+@answer
+By what the failures look like rather than by the fact that there are failures. Provider-side degradation usually arrives as 429s and 503s with response bodies and rising server-reported latency, and it correlates with the provider's status page and with other tenants and regions failing simultaneously. A local network problem shows up as connection timeouts and DNS or TLS handshake failures with no HTTP response at all, it is often confined to one host or one availability zone, and other outbound calls from that host are unhappy too. So I would tag every failure with its class — connect, TLS, timeout, HTTP status — because "error rate" alone cannot distinguish them, and check whether unrelated outbound dependencies from the same host are also failing. That is a thirty-second check that decides whether you are waiting for someone else's incident or fixing your own, and getting it wrong wastes the first and most valuable part of an outage.
+@red
+- No timeout on the provider call, so a slow dependency exhausts the pool.
+- A fallback provider that has never been exercised or evaluated.
+- Retrying a failed stream from scratch and duplicating tokens on the client.
+
 # SECTION DevOps, Cloud & Security Incidents | Production is on fire. What do you do in the first five minutes?
 
 ### Your Docker container restarts every few minutes with no error in the logs. Why?

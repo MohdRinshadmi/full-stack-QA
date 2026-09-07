@@ -1,6 +1,6 @@
 # Senior Full-Stack Engineer — Interview Master Bank
 
-**543 questions with full answers, 862 pages**, generated as a designed PDF.
+**558 questions with full answers, 891 pages**, generated as a designed PDF.
 Mapped to the stack on the résumé: React · Next.js · React Native · TypeScript ·
 Node/Express · Python · Golang/Gin · MySQL/Sequelize · PostgreSQL · MongoDB · Redis ·
 AWS · Docker · Nginx/PM2 · CI/CD · Stripe/PayPal/Razorpay · RAG/LLMs/pgvector ·
@@ -17,11 +17,11 @@ deep-dive round.
 
 | File | Contents | Questions | Pages |
 |---|---|---:|---:|
-| `build/master.pdf` | Everything, one book | **543** | 862 |
+| `build/master.pdf` | Everything, one book | **558** | 891 |
 | `build/part1.pdf` | Fundamentals | 171 | 254 |
-| `build/part2.pdf` | Intermediate & Production | 169 | 290 |
-| `build/part3.pdf` | Hard & Senior-Level | 103 | 163 |
-| `build/part4.pdf` | Scenario & System Design | 100 | 163 |
+| `build/part2.pdf` | Intermediate & Production | 173 | 298 |
+| `build/part3.pdf` | Hard & Senior-Level | 110 | 176 |
+| `build/part4.pdf` | Scenario & System Design | 104 | 171 |
 
 ## Answer format
 

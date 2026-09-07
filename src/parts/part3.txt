@@ -1972,6 +1972,375 @@ It does if you let it grow to cover everything, which is why the interface is de
 - No cancellation in a streaming interface.
 - Framework abstractions on the production path where you need to see the exact prompt.
 
+### How do you choose and tune a `pgvector` index — HNSW or IVFFlat?
+@short
+HNSW almost always, because it gives better recall at the same latency and does not need the data to exist before you build it. IVFFlat is worth considering only when index build time or memory is the binding constraint. The knobs that matter are `m` and `ef_construction` at build time, and `ef_search` at query time — and `ef_search` is the one you actually tune, because it is the live dial between recall and latency.
+@deep
+HNSW is a navigable small-world graph: each vector is a node with `m` neighbours per layer, and a search walks the graph greedily from an entry point, keeping a candidate list of size `ef_search`. Bigger `ef_search` means a wider walk, which means better recall and more time. IVFFlat instead partitions the space into `lists` centroids and scans `probes` of them, so it is cheap to build and degrades badly when the data distribution shifts after the build.
+
+The critical operational fact about IVFFlat is that it must be built on representative data — building it on an empty or tiny table produces useless centroids, and it does not rebalance as you insert. HNSW has no such trap, which is most of why it is the default answer.
+
+Both are approximate. Neither guarantees the true top-k, and that is the thing to say out loud: you are trading exactness for latency, and the size of that trade is measurable on your own golden set rather than assumable.
+@code sql The knobs, what each costs, and how to tune them honestly
+-- BUILD TIME ------------------------------------------------------------
+--   m               graph degree. 16 default. ↑ = better recall, more memory,
+--                   slower build. 32–64 only for high-dimensional, high-recall needs.
+--   ef_construction candidate list while building. 64 default. ↑ = better graph
+--                   quality, much slower build. 128–200 is a common upgrade.
+CREATE INDEX CONCURRENTLY idx_chunks_hnsw
+  ON chunks USING hnsw (embedding vector_cosine_ops)
+  WITH (m = 16, ef_construction = 128);
+
+-- Build is the expensive part. Buy it back with memory and parallelism:
+SET maintenance_work_mem = '4GB';          -- graph built in memory or it spills to disk
+SET max_parallel_maintenance_workers = 7;  -- pgvector 0.6+ builds in parallel
+
+-- QUERY TIME ------------------------------------------------------------
+--   ef_search  candidate list while searching. 40 default. MUST be >= LIMIT.
+SET LOCAL hnsw.ef_search = 100;            -- per-transaction, not global
+SELECT id, content, embedding <=> $1 AS distance
+  FROM chunks WHERE tenant_id = $2
+ ORDER BY distance LIMIT 20;
+
+-- IVFFlat, for the case where build cost dominates:
+--   lists  ≈ rows/1000 up to 1M rows, then sqrt(rows). probes ≈ sqrt(lists).
+CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 1000);
+SET LOCAL ivfflat.probes = 32;
+-- ⚠ built on an empty table the centroids are garbage; it needs a rebuild after load.
+@end
+@arch How I actually pick ef_search — measure, do not guess
+  Golden set: 200 (query -> known-correct chunk id) pairs from real usage.
+  For each ef_search, measure recall@20 against an exact brute-force scan.
+
+  ef_search   recall@20   p95 latency   verdict
+  ─────────────────────────────────────────────────────────────────────
+     40          0.86        12 ms      default — silently losing answers
+     64          0.93        18 ms
+    100          0.97        27 ms      ← the knee. This is the setting.
+    200          0.985       58 ms      +1.5% recall for +31 ms
+    400          0.99       140 ms      not worth it
+   exact         1.00       900 ms      the baseline you compare against
+
+  The knee is where recall stops paying for latency. It is corpus-specific,
+  it moves as the corpus grows, and it is the number to re-measure — not
+  a value to copy from a blog post.
+@end
+@senior
+The point I would make in an interview is that `ef_search` is a per-query dial, not a global setting, so it can be raised for the operations that deserve it and left low for the ones that do not — a background reindexing job or a high-value support query can afford 200 where a type-ahead cannot. I set it with `SET LOCAL` inside the transaction so it cannot leak into the connection pool, which is a real bug: a pooled connection left at `ef_search = 400` makes unrelated queries mysteriously slow for whoever gets that connection next.
+
+The second point is that recall is not observable in production — a missing chunk produces a plausible answer, not an error — so the golden set is not a nicety, it is the only instrument you have. I measure recall against an exact scan on a sample, not against the ANN index itself, because comparing an approximation to itself always looks perfect.
+@followup
+Your HNSW index no longer fits in memory. What are the options, in order?
+@answer
+In cost order: reduce the vector, then reduce the index, then reduce the scope, then move the data. `halfvec` halves storage for a recall loss usually under a percent and is a one-line migration. Matryoshka truncation to 768 dimensions halves it again if the model supports it. Lowering `m` shrinks the graph but degrades recall more sharply, so I would do it after the first two. Partial indexes per tenant or per document class keep each index small and are very effective when queries are always scoped anyway. Binary quantisation with an exact rerank over the survivors is the pattern for genuinely large corpora — a cheap Hamming scan for 500 candidates, exact cosine on those. Only after all of that would I add a dedicated vector store, because that is a new datastore to operate, not a tuning change.
+@red
+- Building IVFFlat on an empty table and never rebuilding it.
+- Setting `hnsw.ef_search` globally, or leaving it elevated on a pooled connection.
+- Quoting recall numbers with no exact-scan baseline to compare against.
+
+### How do you combine metadata filters with vector search without destroying recall?
+@short
+The naive version — filter in a `WHERE` clause alongside an ANN `ORDER BY` — quietly returns fewer results than you asked for, because the index walks the graph first and the filter then removes survivors. The fixes are partial indexes when the filter is a small, fixed set of values, `iterative_scan` on modern pgvector, and pre-filtering to an exact scan when the filter is selective enough that the candidate set is small.
+@deep
+This is the failure mode most teams hit second, after chunking. HNSW searches the graph for the nearest `ef_search` vectors globally, and Postgres applies your `WHERE tenant_id = 42` to whatever came back. If tenant 42 is 0.1% of the corpus, a walk that returns 100 candidates may contain zero of their chunks — so the query returns nothing, or three rows, and it looks like a retrieval bug rather than an index behaviour.
+
+There are three regimes, and the right answer is to identify which one you are in rather than to pick a favourite technique. When the filter matches most of the corpus, post-filtering is fine. When it matches a small fraction — a single tenant, one document — an exact scan over that subset is both correct and fast, because the subset is small. The awkward middle is where `iterative_scan` earns its place: pgvector 0.8 will keep walking the graph until it has enough rows that pass the filter, instead of giving up after the first batch.
+@code sql The three regimes, and how to make Postgres pick the right one
+-- ❌ THE TRAP: silently under-returns when tenant_id is selective
+SELECT id, content FROM chunks
+ WHERE tenant_id = 42                      -- applied AFTER the ANN walk
+ ORDER BY embedding <=> $1 LIMIT 20;       -- may return 0–5 rows, not 20
+
+-- ✅ 1. SELECTIVE FILTER (< ~1% of rows): force the exact path. It is fast
+--       because the subset is small, and it is exact, not approximate.
+SELECT id, content FROM chunks
+ WHERE tenant_id = 42
+ ORDER BY embedding <=> $1 LIMIT 20;
+-- with a btree on (tenant_id) and the planner choosing it — verify with EXPLAIN.
+-- If the planner insists on the HNSW index, this forces the issue:
+--   BEGIN; SET LOCAL enable_indexscan = off;  -- blunt, but explicit
+
+-- ✅ 2. FIXED, LOW-CARDINALITY FILTER: a partial index per value.
+--       Each index is small, in-memory, and exact for its slice.
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)
+  WHERE doc_type = 'contract';
+CREATE INDEX ON chunks USING hnsw (embedding vector_cosine_ops)
+  WHERE doc_type = 'policy';
+
+-- ✅ 3. THE MIDDLE (pgvector 0.8+): keep walking until the filter is satisfied.
+BEGIN;
+  SET LOCAL hnsw.iterative_scan = relaxed_order;   -- or strict_order
+  SET LOCAL hnsw.max_scan_tuples = 20000;          -- bound the worst case
+  SELECT id, content FROM chunks
+   WHERE tenant_id = 42 AND created_at > now() - interval '90 days'
+   ORDER BY embedding <=> $1 LIMIT 20;
+COMMIT;
+
+-- ✅ 4. MULTI-TENANCY AT SCALE: partition, so the filter becomes partition pruning
+--       and each partition carries its own small HNSW index.
+CREATE TABLE chunks (tenant_id int, embedding vector(1536), ...)
+  PARTITION BY HASH (tenant_id);
+@end
+@senior
+The senior framing is that this is a correctness bug that presents as a quality complaint. Nobody files "the ANN index post-filtered my results"; they file "the assistant says it cannot find our refund policy", and the policy is right there in the corpus. So the thing I would instrument is the gap between requested `LIMIT` and rows actually returned — if a query asked for 20 and got 6, that is a filtered-recall event and it should be a metric, not a silent shrug.
+
+On multi-tenancy specifically, I would argue the filter should not be a filter at all where it can be avoided. Partitioning by tenant, or a partial index per large tenant, turns "search everything then discard" into "search only what is relevant", which is faster and exact and removes the cross-tenant leak risk structurally rather than by remembering to write the `WHERE` clause. A tenant filter you can forget to write is a data-leak waiting for one careless query; a partition boundary is not.
+@followup
+How do you prove no cross-tenant leakage is possible?
+@answer
+By making it structural rather than disciplinary. Row-level security on the chunks table with the tenant set from the session, so a missing `WHERE` clause returns nothing instead of everything, is the strongest single control — the database enforces it, not the developer. Above that, the retrieval layer takes the tenant from the authenticated session and never from a request parameter, so it cannot be supplied by the caller. And I would add a test that runs the full retrieval path as tenant A against a corpus seeded with a distinctive tenant B document and asserts it is never returned, plus the same assertion on the semantic cache key, because a cache keyed only on the question text is the second leak path and it is easy to miss.
+@red
+- Filtering in the `WHERE` clause and assuming the `LIMIT` was satisfied.
+- Relying on the application always remembering the tenant predicate.
+- Testing filtered retrieval only with a corpus small enough that everything is returned anyway.
+
+### How do you handle the gap between what the user typed and what you should search for?
+@short
+The raw question is often a bad query — it is a follow-up with a pronoun in it, or it is phrased in words the corpus never uses. So I rewrite it before retrieving: resolve conversational references against the history, and where the vocabulary gap is real, expand into several queries and fuse the results. The rule I hold to is that the rewrite is for retrieval only — the model still answers from the user's actual words.
+@deep
+Three distinct problems get bundled under "query transformation" and they need separating, because they have different costs.
+
+The first is conversational reference. "What about for enterprise?" is meaningless as an embedding — it retrieves nothing useful because it is about nothing on its own. It has to be rewritten against the conversation into "What is the refund window for enterprise customers?" before it touches the index. This one is close to mandatory in any chat interface, and it is a cheap, small-model call.
+
+The second is vocabulary mismatch: the user says "can I get my money back" and the corpus says "reimbursement eligibility". Multi-query expansion generates several phrasings, retrieves for each, and fuses with reciprocal rank fusion. It costs one extra generation and N retrievals, and it measurably helps on corpora with domain jargon.
+
+The third is HyDE — generate a hypothetical answer and embed that, on the theory that a fake answer sits closer in the embedding space to the real answer than the question does. It is genuinely clever and I would use it selectively, because it adds a full generation to the latency budget and it can confidently hallucinate its way toward the wrong region of the space.
+@code ts Rewrite for retrieval, answer from the original
+const REWRITE = `Rewrite the final user message as a standalone search query.
+Resolve every pronoun and reference using the conversation. Output the query only.
+If it is already standalone, output it unchanged.`;
+
+async function retrieveForTurn(history: Turn[], question: string) {
+  // 1. CONVERSATIONAL REWRITE — cheap model, low latency, high value
+  const standalone = await generate(REWRITE, { history: last(history, 6), question },
+                                    { model: FAST_MODEL, max_tokens: 80 });
+
+  // 2. MULTI-QUERY — only when the rewrite looks jargon-poor or recall was thin
+  const queries = needsExpansion(standalone)
+    ? [standalone, ...await generate(EXPAND, { standalone }, { max_tokens: 120 })]
+    : [standalone];
+
+  // 3. RETRIEVE IN PARALLEL, FUSE BY RANK (not by score — scores are not comparable)
+  const runs = await Promise.all(queries.map(q => hybridSearch(q, { k: 20 })));
+  return reciprocalRankFusion(runs, { k: 60 }).slice(0, 20);
+}
+
+function reciprocalRankFusion(runs: Hit[][], { k }: { k: number }) {
+  const scores = new Map<string, number>();
+  for (const run of runs)
+    run.forEach((hit, rank) =>
+      scores.set(hit.id, (scores.get(hit.id) ?? 0) + 1 / (k + rank + 1)));
+  return [...scores.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => byId(id));
+}
+
+// ✅ The generation prompt gets the ORIGINAL question, never the rewrite —
+//    otherwise the model answers a question the user did not ask.
+const answer = await generate(ANSWER, { question, chunks: fused });
+@end
+@senior
+The trade-off worth naming is latency. Every transformation is a serial LLM call in front of retrieval, so a naive pipeline that rewrites, expands, retrieves, reranks and then generates has four round trips before a single token reaches the user. I keep the rewrite because it fixes a correctness problem, run it on the fastest model available, and make expansion conditional rather than unconditional — triggered when the first retrieval comes back with weak scores, so the common case stays fast and only the hard queries pay.
+
+The failure mode I have actually hit is the rewrite changing the question's meaning — a rewrite that "helpfully" narrows "what are the fees" into "what is the late payment fee" produces a confident answer to the wrong question, and it is nearly invisible in logs unless you record both strings. So I log the original and the rewrite together on every turn, and the rewrite is never what the answering model sees.
+@followup
+When is query transformation the wrong fix?
+@answer
+When the real problem is chunking or the corpus, which it usually is. If the document simply does not contain the answer, no amount of query rewriting will retrieve it, and adding transformation layers just makes a failing pipeline slower and harder to debug. My order of investigation is: is the answer in the corpus at all, is it in a chunk that makes sense on its own, does hybrid search find it when I search manually, and only then is the query the problem. Transformation is also wrong for the first turn of a conversation with a well-phrased question — there is nothing to resolve, so the call is pure latency, which is why I gate it on whether the question actually contains an unresolved reference.
+@red
+- Feeding the rewritten query to the answering model instead of the user's real question.
+- Running HyDE and multi-query unconditionally and eating 800ms on every turn.
+- Fusing by raw score across retrievers whose scores are on different scales.
+
+### When is a reranker worth its latency, and how do you deploy one?
+@short
+A reranker is a cross-encoder that scores each candidate against the query jointly, rather than comparing two independently produced vectors, so it is far more accurate and far more expensive. The pattern is retrieve wide and cheap — 50 to 100 candidates by hybrid search — then rerank down to the 5 you actually send to the model. It is worth it when the answer is usually in the top 50 but not in the top 5, which is exactly what a recall curve tells you.
+@deep
+The reason a bi-encoder and a cross-encoder differ so much is structural. An embedding is computed for the chunk before it ever sees your query, so it has to be a general-purpose summary of that chunk. A cross-encoder reads the query and the chunk together and can attend across both, so it can tell that a passage mentioning "refund" is about refund *timing* rather than refund *eligibility*. That is why it wins on precision, and also why it cannot be precomputed or indexed — it is O(candidates) model calls per query.
+
+The decision is a measurement, not a preference. If recall@50 is 0.95 and recall@5 is 0.70, there is 25 points of accuracy sitting in the gap and a reranker recovers most of it. If recall@50 and recall@5 are both 0.72, the answer is not in the candidate set and the reranker has nothing to work with — the problem is chunking or hybrid search, and adding a reranker buys latency and nothing else.
+@code ts Retrieve wide, rerank narrow, with a latency budget that degrades safely
+async function retrieveAndRank(query: string, k = 5): Promise<Chunk[]> {
+  // STAGE 1 — cheap and wide. Hybrid, because vector alone misses exact terms.
+  const candidates = await hybridSearch(query, { k: 60 });     // ~30ms
+
+  // STAGE 2 — expensive and narrow, with a hard deadline.
+  try {
+    const scored = await withTimeout(
+      rerank(query, candidates.map(c => c.content)),            // ~120ms, one batch
+      { ms: 250 },
+    );
+    return scored
+      .filter(s => s.score > RELEVANCE_FLOOR)   // ← the underrated part: drop the junk
+      .slice(0, k)
+      .map(s => candidates[s.index]);
+  } catch (e) {
+    // ✅ Degrade to stage 1 order rather than failing the request.
+    metrics.increment('rerank.fallback', { reason: e.name });
+    return candidates.slice(0, k);
+  }
+}
+
+// Batch the whole candidate set in ONE call. N sequential calls is the mistake
+// that turns a 120ms stage into a 6-second one.
+@end
+@senior
+The part people skip is the relevance floor. A reranker does not only reorder — it gives you a calibrated score you can threshold on, which means you can return four chunks instead of five, or zero chunks and an honest "I do not have that information". That is a real quality gain, because the largest single source of confident wrong answers is padding the context with the least-bad remaining chunks until you have filled k slots. Retrieval scores from a bi-encoder are not calibrated well enough to threshold on; cross-encoder scores are.
+
+On deployment, I would state the cost plainly: a hosted reranker is a network call and a per-query price, a self-hosted one is a GPU you now operate. For a corpus and traffic level like mine, hosted with a strict timeout and a graceful fallback is obviously right, and I would only consider self-hosting when either data residency forbids the call or volume makes the per-query price larger than an instance.
+@followup
+Does a reranker let you skip hybrid search?
+@answer
+No, and this is the ordering people get backwards. A reranker can only reorder what retrieval handed it, so if the vector search never surfaced the chunk containing the exact error code the user pasted, reranking a list that does not contain it changes nothing. Hybrid search fixes recall; reranking fixes precision. They solve different halves of the problem and the recall half has to be solved first — which is also why I measure recall@50 before I consider a reranker at all, because that number tells me whether there is anything for it to find.
+@red
+- Adding a reranker when recall@50 and recall@5 are the same — spending latency for nothing.
+- Reranking one chunk per call instead of batching.
+- Ignoring the score and always returning exactly k chunks.
+
+### RAG, fine-tuning, long context or tools — how do you choose?
+@short
+They solve different problems and the mistake is treating them as competing options. RAG injects knowledge the model does not have. Fine-tuning changes behaviour, format and style, not facts. Long context is a delivery mechanism for a small, bounded set of documents. Tools are for anything that is live, transactional, or computed. I start with RAG plus tools because they are cheapest to change, and I reach for fine-tuning only when the requirement is a consistent behaviour I cannot get from prompting.
+@deep
+The distinction that matters is knowledge versus behaviour. Fine-tuning is very good at teaching a model to always answer in your output schema, adopt a house tone, or handle a classification task with a small model that would otherwise need a large one. It is bad at teaching facts: the facts get blended into weights, they cannot be cited, they cannot be updated without retraining, and the model becomes more confidently wrong when they change. Any requirement containing the phrase "and it must be up to date" rules fine-tuning out.
+
+Long context is the option that looks like it deletes the problem and does not. It works honestly well when the corpus is genuinely small and bounded — one contract, one codebase module, a single policy handbook. Past that it fails on three axes at once: cost scales linearly with every token on every request, latency scales with it, and attention quality degrades in the middle of very long inputs, so the model can miss a fact that is demonstrably present.
+
+Tools are the one people under-use. "What is my current balance" is not a retrieval question and no amount of embedding will make it one — it is an API call. A large fraction of what gets built as RAG should have been function calling against the system of record.
+@arch The decision, made on the requirement rather than on the technology
+  REQUIREMENT                              ANSWER            WHY
+  ─────────────────────────────────────────────────────────────────────────────
+  answer from 40k internal documents       RAG               too big for context,
+                                                             needs citations
+  answer changes when a doc is edited      RAG               weights cannot be
+                                                             edited; an index can
+  "what is my order status right now"      TOOL              live, per-user,
+                                                             transactional
+  always emit this exact JSON shape        STRUCTURED OUTPUT try schema-constrained
+                                                             decoding FIRST
+  always adopt this tone / house style     FINE-TUNE         behaviour, not fact
+  classify 10M tickets cheaply             FINE-TUNE small   quality of a big model
+                                            model             at a small model price
+  reason over ONE 200-page contract        LONG CONTEXT      bounded, and the whole
+                                                             document is relevant
+  domain jargon retrieval keeps missing    FINE-TUNE the     the retrieval is the
+                                            EMBEDDING model   problem, not the LLM
+
+  Note the last row: fine-tuning the embedding model is usually a far better
+  investment than fine-tuning the generator, and almost nobody considers it.
+@end
+@senior
+The nuance I would offer is that these compose, and the strongest systems use three of them at once — retrieval for knowledge, tools for live state, and constrained decoding for shape — while using no fine-tuning at all. So when someone frames it as "should we fine-tune or do RAG", I would push back on the premise and ask what the actual failure is. If the complaint is "it gets facts wrong", fine-tuning makes that worse, not better.
+
+I would also be honest about the economics from the other direction: fine-tuning a small model to replace a large one on a narrow, high-volume task is one of the few reliable order-of-magnitude cost wins available, and it is underused because it feels like more work than changing a prompt. It is more work — it needs a dataset, an eval and a retraining path — and on a task running millions of times a month it pays for itself quickly.
+@followup
+What would make you fine-tune an embedding model?
+@answer
+A recall problem that survives good chunking and hybrid search, on a corpus whose vocabulary is genuinely unlike anything in the model's training data — internal part numbers, clinical shorthand, a jargon-dense domain where the general model puts unrelated terms close together. The signal is that my golden set shows the right chunk sitting at rank 40 rather than absent, meaning the space is nearly right but not discriminating. It needs training pairs, which in practice come from real query logs plus the chunk that turned out to be correct, so it is only available once the system has been running. Before that I would try a domain-appropriate off-the-shelf model and hybrid search, because both are a day's work rather than a project.
+@red
+- Proposing fine-tuning as the fix for factual errors or stale data.
+- Treating long context as a free replacement for retrieval at any corpus size.
+- Building retrieval over data that should have been a function call.
+
+### How do you design a voice pipeline — speech in, speech out — so it feels instant?
+@short
+By streaming every stage and overlapping them, so the user hears the first syllable while the rest is still being generated. The budget I hold to is under a second from the user finishing speaking to audio starting: partial transcripts stream during speech, generation starts on the finalised transcript, and text-to-speech runs sentence by sentence rather than waiting for the whole answer. Barge-in — cancelling everything the instant the user speaks — matters as much as raw latency, because being talked over is what makes an assistant feel broken.
+@deep
+The naive pipeline is four blocking stages: record fully, transcribe fully, generate fully, synthesise fully, then play. Each stage waits for the previous one to complete, so the latencies add up and the user sits in silence for four or five seconds. Every fix is the same idea applied at a different boundary — start the next stage on the first useful output of the previous one rather than on its last.
+
+The pieces that buy the most are streaming transcription with endpointing, so the transcript is essentially finished the moment the user stops talking rather than starting then; retrieval issued speculatively on the partial transcript, because a stable partial is usually enough to pick the right chunks; and sentence-boundary chunking into TTS, because a single sentence takes a few hundred milliseconds to synthesise while a full paragraph takes seconds.
+
+Endpointing is the underrated component. Deciding when the user has actually finished — as opposed to pausing mid-thought — is the difference between an assistant that interrupts people and one that feels slow. A fixed silence threshold is wrong in both directions, and this is where most of the perceived quality lives.
+@arch Where the second goes, and how overlapping it recovers most of it
+  SERIAL (the naive build)                   ~4.4s of silence
+  ┌────────────┬──────────┬──────────────┬───────────┐
+  │ record     │ STT 600  │ LLM 2200     │ TTS 1100  │ ▶ audio
+  └────────────┴──────────┴──────────────┴───────────┘
+
+  OVERLAPPED (what I would build)            ~0.9s to first audio
+  record ──┬── STT streams partials ──┐
+           │                          ├─ endpoint detected
+           └── retrieval on partial ──┘   (speculative, ~120ms, already warm)
+                                       └─ LLM streams tokens ──┐
+                                            first sentence ────┴─ TTS sentence 1 ▶
+                                            sentence 2 ─────────── TTS sentence 2 ▶
+                                                                  (queued, gapless)
+
+  BARGE-IN: user speaks at any point
+    → stop audio playback immediately (do not finish the sentence)
+    → AbortController on the LLM stream (stops token spend too)
+    → drop the TTS queue
+    → the interrupted turn is still written to history, marked truncated,
+      because the model must know what the user actually heard
+@end
+@senior
+The engineering point I would make is that this is a cancellation problem more than a speed problem. Three concurrent streams — audio out, tokens in, transcription — all have to die instantly and in the right order when the user starts speaking, and the state has to remain coherent afterwards. If the interrupted response is written to conversation history as though it completed, the model will reference things the user never heard, and the conversation quietly goes wrong. So I record what was actually spoken aloud, not what was generated.
+
+I would also flag the thing that surprised me: the perceptual budget is not uniform. Users tolerate a two-second pause before a long, considered answer far better than half a second of dead air before "yes" — silence with no signal is what reads as broken. A short acknowledgement token, or even the audio channel opening, resets the clock. That is a product observation with a direct engineering consequence, which is that I optimise time-to-first-audio rather than total response time, and they are very different targets.
+@followup
+The transcription is wrong for domain-specific words. What do you do?
+@answer
+Start with the cheap controls before touching models. Most speech-to-text APIs accept a vocabulary or phrase hint list, and seeding it with the product names, customer names and jargon relevant to that user fixes the majority of it for the cost of a request parameter — and it can be personalised per tenant, which is where the wins are. Beyond that, retrieval can absorb a surprising amount of transcription noise: hybrid search with fuzzy matching still finds the right chunk when a product name is misheard by a character or two, so the pipeline is more robust than the transcript. What I would not do is have the LLM "correct" the transcript freely, because it will silently rewrite what the user said into something more plausible, and a misheard word that produces a confident answer to a different question is worse than an obvious mistranscription the user can see and repeat.
+@red
+- Waiting for the full generation before starting text-to-speech.
+- No barge-in, so the assistant talks over the user.
+- Recording the generated response in history when playback was cut off.
+
+### How do you manage conversation memory without the context window growing forever?
+@short
+A rolling window of recent turns kept verbatim, an older summary that is updated incrementally, and durable facts extracted into structured storage rather than left in prose. The reason not to simply send everything is not only cost — it is that a long, diluted context measurably degrades answer quality, and it makes every turn slower and more expensive than the last.
+@deep
+Naive accumulation has a compounding problem: turn 50 pays for turns 1 through 49 on every request, so cost and latency grow linearly within a conversation while quality drifts downward as the genuinely relevant recent turns get diluted by stale ones.
+
+The three tiers each hold a different kind of thing. Recent turns need to be verbatim, because pronouns and corrections resolve against exact wording. Older context can be a summary, updated incrementally when the window overflows rather than regenerated from scratch each time — regenerating is both expensive and lossy, since summarising a summary compounds distortion. And durable facts — the user's name, their plan, a preference they stated once in turn 3 — belong in a structured store, retrieved by relevance, not carried along in a prose blob where they will eventually be summarised away.
+
+That third tier is the one that separates a system that works at turn 60 from one that does not. "I'm allergic to shellfish", said once, must survive indefinitely, and no summarisation strategy reliably preserves it.
+@code ts Three tiers: verbatim recent, incremental summary, structured facts
+async function buildContext(sessionId: string, question: string) {
+  const s = await sessions.get(sessionId);
+
+  // TIER 1 — verbatim recent turns. Budget in TOKENS, not in turn count:
+  // one turn containing a pasted stack trace is not one turn's worth of context.
+  const recent = takeWithinBudget(s.turns, { tokens: 2000 });
+
+  // TIER 3 — durable facts, retrieved by relevance to THIS question.
+  const facts = await memory.search(s.userId, question, { k: 5 });
+
+  return { summary: s.summary, facts, recent, question };
+}
+
+// Compaction runs when the window overflows — incremental, never from scratch.
+async function compact(sessionId: string) {
+  const s = await sessions.get(sessionId);
+  if (tokensOf(s.turns) < COMPACT_AT) return;
+
+  const [older, keep] = splitAt(s.turns, -RECENT_TURNS);
+
+  const summary = await generate(SUMMARISE, { previous: s.summary, older },
+    { max_tokens: 400 });                       // ✅ folds INTO the old summary
+
+  // Extraction is a separate call with a schema — facts must not be prose.
+  const extracted = await generate(EXTRACT_FACTS, { older }, {
+    schema: z.array(z.object({
+      kind: z.enum(['preference', 'constraint', 'identity', 'commitment']),
+      fact: z.string(), confidence: z.number(),
+    })),
+  });
+  await memory.upsert(s.userId, extracted.filter(f => f.confidence > 0.8));
+
+  await sessions.update(sessionId, { summary, turns: keep });
+}
+@end
+@senior
+The failure I would highlight is contradiction. A user says "actually, make it the 15th" at turn 20, and if the extraction layer appends rather than supersedes, the store now holds two conflicting commitments and the model picks one arbitrarily. So facts need identity and recency — an upsert keyed on what the fact is about, not an append — and the retrieval has to prefer the latest. That is a boring database concern rather than an AI one, which is exactly why it gets missed in AI codebases.
+
+The second thing is that memory is a privacy surface. Anything extracted and stored durably is personal data with a retention obligation and a deletion path, and it needs the same tenant isolation as the document corpus. "Delete my account" has to clear the extracted memory too, and if that memory has been embedded for retrieval, it has to clear the vectors — which is the same index-versus-source-of-truth sync problem as the document pipeline, and worth saying out loud because it is the one people forget.
+@followup
+How do you keep quality from degrading right after a compaction?
+@answer
+By measuring it explicitly, because it is the moment where things break and it is invisible otherwise. I keep a set of multi-turn evaluation conversations that deliberately reference something from early on after a compaction has happened, and I assert the answer still holds — that is the regression test for the summariser, and it is the only way to know the prompt change you just made did not quietly start dropping constraints. In the design itself, the protection is that anything load-bearing should not be relying on the summary at all: constraints, commitments and identity go to the structured store where they are retrieved exactly, and the summary carries narrative context whose loss is survivable. If losing a detail would produce a wrong answer rather than a vaguer one, it does not belong in prose.
+@red
+- Sending the entire conversation history on every turn.
+- Re-summarising the whole conversation from scratch at each compaction.
+- Appending contradictory extracted facts instead of superseding them.
+
 # SECTION Concurrency, Consistency & Coordination | The bugs that only appear under load, and how to make them impossible.
 
 ### How do you prevent overselling the last item in stock?
