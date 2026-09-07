@@ -3221,6 +3221,329 @@ Expand and contract at the schema level too: add the new column, dual-write to b
 - Changing a response field's type in place.
 - Removing a version with no usage data and no notice.
 
+# SECTION Python & FastAPI | Python is on your CV as a language and FastAPI as a framework, from self-directed pipeline and RAG work rather than production. State that once, then answer at depth — listing a language is an invitation to be tested on it.
+
+### How does Python's GIL affect concurrency, and when does it actually matter?
+@short
+The GIL means only one thread executes Python bytecode at a time, so threads give you no CPU parallelism. They still give you I/O concurrency, because the lock is released around blocking I/O — so for an API or an ingestion pipeline waiting on an embedding endpoint, threads and asyncio both work. For CPU-bound work you need separate processes, which is what `multiprocessing` and Gunicorn or Uvicorn workers give you.
+@deep
+The practical consequence is that "add threads" is the wrong instinct for CPU-bound Python and the right one for I/O-bound Python, and knowing which you have is the whole question. Profiling answers it: if the process is at 100% of one core, you are CPU-bound and threads will not help.
+
+The other consequence is deployment shape. A Python API scales by running N worker processes behind a supervisor, one per core, rather than by threading inside one process — which is the same conclusion Node reaches by a completely different route.
+@code text Which concurrency model for which workload
+  WORKLOAD              GIL IMPACT            USE
+  ─────────────────────────────────────────────────────────────────
+  HTTP request handling  none (I/O releases)   async def + asyncio
+  calling an LLM / API   none (I/O releases)   asyncio.gather
+  reading files / DB     none (I/O releases)   async, or a thread pool
+  ─────────────────────────────────────────────────────────────────
+  embedding maths        FULL — serialised     multiprocessing / native
+  parsing 10k documents  FULL — serialised     ProcessPoolExecutor
+  image / video work     FULL — serialised     separate worker service
+  ─────────────────────────────────────────────────────────────────
+  NUMPY / native libs    RELEASED inside C     threads DO parallelise
+                         → this is the exception people forget:
+                           numpy, pandas and most native extensions
+                           drop the GIL in their C code
+
+  DEPLOYMENT   uvicorn --workers $(nproc)   ← processes, not threads
+               each worker is a separate interpreter, separate GIL
+@end
+@senior
+The nuance worth volunteering is that the GIL is released inside native extensions, so numpy-heavy work genuinely does parallelise across threads. That is why "Python is slow and single-threaded" is too crude a statement to be useful — the interesting question is always where the time is being spent, and in a data pipeline it is usually inside C code or waiting on the network rather than in the interpreter.
+
+I would also say that in my own pipeline work the bottleneck was never the GIL. It was the embedding API's rate limit, which no amount of local concurrency improves — the correct fix was batching and backoff, not parallelism. Reaching for concurrency before measuring is how you end up with a complicated program that is exactly as slow as the simple one.
+@followup
+Does free-threaded Python change your answer?
+@answer
+It changes the ceiling rather than the approach. The free-threaded builds remove the GIL so threads can genuinely parallelise pure-Python CPU work, which is a real shift for workloads that previously had to use processes. I would still not redesign around it today: the ecosystem support for C extensions is still maturing, single-threaded performance carries a cost in some builds, and the process-per-core model is well understood and works everywhere. I would treat it as something to evaluate for a specific CPU-bound service with a benchmark, not as a general default — and I would be honest that I have read about it rather than run it in anger.
+@red
+- Claiming the GIL makes Python unusable for web services.
+- Reaching for threads to speed up CPU-bound Python.
+- Not knowing native extensions release the GIL.
+
+### In FastAPI, when do you write `async def` and when plain `def` — and what happens if you get it wrong?
+@short
+`async def` when the handler awaits I/O with async libraries; plain `def` when the work is blocking or CPU-bound. Getting it wrong in one specific direction is severe: a blocking call inside `async def` stalls the entire event loop, so one slow request freezes every concurrent request in that worker. Plain `def` is safe because FastAPI runs it in a thread pool.
+@deep
+This is the single most common FastAPI production bug and it is invisible in development, because with one user there is nothing to block. Under concurrency it presents as latency that scales with load in a way that makes no sense until you understand the cause.
+
+The asymmetry is worth internalising: declaring a handler `def` when it could have been async costs you a thread and a little throughput. Declaring it `async def` and then blocking inside it costs you the whole worker.
+@code python The bug, and both correct forms
+# ✘ WRONG — blocking call inside async def: freezes the event loop
+@app.get("/report")
+async def report():
+    rows = db.execute("SELECT ...")      # blocking driver — STALLS EVERYTHING
+    return heavy_pandas_transform(rows)  # CPU-bound — STALLS EVERYTHING
+
+# ✔ CORRECT (a) — plain def: FastAPI runs it in a threadpool automatically
+@app.get("/report")
+def report():
+    rows = db.execute("SELECT ...")      # blocking is fine here
+    return heavy_pandas_transform(rows)  # still holds the GIL, but not the loop
+
+# ✔ CORRECT (b) — async all the way down: async driver, awaited
+@app.get("/report")
+async def report():
+    rows = await async_db.fetch("SELECT ...")          # async driver
+    return await run_in_threadpool(heavy_transform, rows)  # offload CPU work
+
+# ✔ CORRECT (c) — genuinely concurrent I/O, the reason to use async at all
+@app.get("/enrich")
+async def enrich(ids: list[str]):
+    return await asyncio.gather(*(fetch_one(i) for i in ids))
+    # 20 calls at 200ms each: ~200ms concurrently, ~4s sequentially
+@end
+@senior
+The detection story is what I would lead with, because the bug is easy to describe and hard to find. The symptom is that p99 latency degrades under concurrency while CPU sits low and the database is idle — the worker is not busy, it is blocked. `asyncio` debug mode logs callbacks that take too long, and that is usually what identifies it.
+
+The design conclusion I draw is that mixing sync and async database drivers in one codebase is where this bug is born, so I would standardise on one and enforce it — an async endpoint that imports the sync client is a lint rule, not a code-review conversation. It is the same class of discipline as never calling a synchronous file read in a Node request handler, and it is worth being explicit that Node has exactly the same failure mode with `fs.readFileSync` or a long synchronous loop.
+@followup
+How does this compare with the equivalent mistake in Node?
+@answer
+It is the same mistake with the same mechanism — one event loop, one blocking call, everyone waits. The difference is that Node's ecosystem is async by default, so it is genuinely hard to accidentally block: nearly every library returns a promise, and the synchronous variants are named `...Sync` as a warning. Python's ecosystem is predominantly synchronous, so the blocking version of any library is usually the default one and the async version is the exception you have to seek out. That makes the mistake far easier to make in FastAPI than in Express, which is why the `def` versus `async def` choice deserves a review checklist item rather than trust.
+@red
+- Making every handler `async def` because it looks modern.
+- Using a synchronous database driver inside `async def`.
+- CPU-bound work in an async handler with no threadpool offload.
+
+### What does Pydantic actually give you that hand-written validation does not?
+@short
+One declaration that is simultaneously the runtime validator, the static type, the parsing/coercion layer and the OpenAPI schema. In Express I would write a Zod or Joi schema and a TypeScript interface and keep them in sync by discipline; in FastAPI the model is the single source, so the request body cannot be validated against one shape and typed as another.
+@deep
+The property that matters most is parse-don't-validate: the handler receives a typed object that is already guaranteed valid, rather than a raw dict it must check. Invalid input never reaches business logic, so there is no defensive checking scattered through the code.
+
+The generated OpenAPI document is a genuine operational benefit rather than a nicety, because it cannot drift from the implementation — it is derived from the same models the server enforces.
+@code python One model, four jobs
+class CreateOrder(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # reject unknown fields
+
+    customer_id: UUID                            # parsed AND validated
+    items: Annotated[list[Item], Field(min_length=1)]
+    currency: Literal["INR", "USD"]              # enum in the OpenAPI schema
+    coupon: str | None = None
+
+    @field_validator("coupon")
+    @classmethod
+    def normalise(cls, v: str | None) -> str | None:
+        return v.strip().upper() if v else None  # coercion lives WITH the type
+
+@app.post("/orders", response_model=OrderOut, status_code=201)
+async def create(order: CreateOrder) -> OrderOut:
+    # order.customer_id is a UUID object, not a string.
+    # items is non-empty. currency is one of two values. Guaranteed.
+    ...
+
+  THAT ONE CLASS PRODUCES:
+   1  422 with a field-level error list, before your code runs
+   2  a real static type for the editor and the type checker
+   3  coercion: "2026-01-04" → date, "  save10 " → "SAVE10"
+   4  the OpenAPI/JSON-Schema entry that documents the endpoint
+
+  extra="forbid" IS THE ONE I ARGUE FOR:
+    default behaviour silently DROPS unknown fields, so a client sending
+    {"discount": 50} to an endpoint with no discount field gets a 201 and
+    no discount. Forbidding turns a silent no-op into a 422.
+@end
+@senior
+The setting I would defend explicitly is `extra="forbid"`. Silently ignoring unknown fields is the default in most validation stacks and it produces the worst kind of integration bug — the client believes it sent something meaningful, the server returns success, and nobody discovers the mismatch until a reconciliation report disagrees. Failing loudly on an unexpected field converts that into a clear error at the boundary.
+
+The trade-off to be honest about is that strict rejection makes API evolution harder, because adding a field to a client before the server knows about it now breaks. That is a versioning discipline question rather than a reason to be permissive, and I would rather have the conversation than have the silent drop.
+@followup
+Where does Pydantic cost you?
+@answer
+Validation is not free, and on a hot path parsing large nested payloads is measurable — Pydantic v2 moved the core to Rust and is roughly an order of magnitude faster than v1, which changed this from a real concern to a minor one, but it is not zero. The place I would actually be careful is using the same model for the API boundary and the database layer: it couples your public contract to your storage schema, so a column rename becomes a breaking API change. I keep request, response and persistence models separate even though it looks like duplication, because they change for different reasons and at different times.
+@red
+- Treating Pydantic as only a validator and re-checking fields inside the handler.
+- Leaving the default that silently drops unknown fields.
+- One model shared across the API contract and the database schema.
+
+### How would you structure a Python ingestion pipeline so a failure halfway through is recoverable?
+@short
+As idempotent stages with checkpointed state, not as one long script. Each document gets a content hash, each stage records what it has completed, and re-running skips finished work rather than redoing it. That way a crash at document 8,000 of 10,000 resumes rather than restarting, and re-ingesting an unchanged corpus costs almost nothing.
+@deep
+The property that makes this work is that the unit of work is a document and its content hash, not a position in a loop. Position-based resumption breaks the moment the input ordering changes; hash-based resumption is stable under reordering, re-runs and partial corpus updates.
+
+The expensive stage — embedding — is the one that must never be repeated unnecessarily, because it costs money and rate limit. Caching embeddings by chunk hash means a document whose formatting changed but whose text did not is effectively free.
+@code text Stages, checkpoints and the idempotency key
+  discover ──► extract ──► chunk ──► embed ──► upsert
+     │           │           │         │          │
+     │           │           │         │          └─ ON CONFLICT (chunk_hash)
+     │           │           │         │             DO UPDATE  ← idempotent
+     │           │           │         └─ cache: chunk_hash → vector
+     │           │           │            (the only stage that costs money)
+     │           │           └─ deterministic: same text → same chunk hashes
+     │           └─ per-document try/except → dead-letter, never abort the run
+     └─ source listing + content hash
+
+  documents(id, source_uri, content_hash, stage, updated_at)
+    stage ∈ discovered | extracted | chunked | embedded | indexed | failed
+
+  RESUME   WHERE stage != 'indexed' AND content_hash = <current>
+           → a re-run does the remaining work and nothing else
+
+  BATCHING  embed in batches of 96, bounded concurrency (semaphore, ~4),
+            exponential backoff with jitter on 429
+            ← the real bottleneck is the provider's rate limit,
+              not the GIL and not your CPU
+
+  ONE POISON DOCUMENT MUST NOT KILL THE RUN:
+    a 400-page scanned PDF that OCRs to garbage → mark failed, record the
+    error, continue. Then a report of failures, which is a work queue
+    rather than a stack trace at 3am.
+@end
+@senior
+The decision I would defend is doing the transactional swap at the end rather than deleting and rebuilding in place. If you delete the old vectors and the run fails, search is broken until you fix it — so I write to a new version and switch a pointer, which makes rollback instant and keeps the index queryable throughout.
+
+The second point is that this design is not really about Python. The same reasoning applies to the Node sync backend I built for offline geolocation: idempotency keys, per-item failure isolation, and resumability rather than restartability. That is the transferable idea, and I would rather present it as a general pattern I have applied twice than as a Python trick.
+@followup
+How do you know the pipeline is producing good output, not just completing?
+@answer
+Completion metrics and quality metrics are different things and I track both. Completion is documents processed, failed and skipped, plus a failure report. Quality is measured against a golden set of questions with known correct source documents — recall@k after every ingestion change, so a chunking tweak that quietly reduces retrieval quality is caught at the pipeline rather than discovered as "the assistant got worse". Without that, a run that finishes cleanly and indexes garbage looks exactly like success.
+@red
+- One long script with no checkpoint.
+- Resuming by loop index rather than by content hash.
+- Re-embedding unchanged content on every run.
+- One malformed document aborting the whole run.
+
+### How do you manage Python dependencies and ship a Python service?
+@short
+A lockfile, a virtual environment, and a multi-stage container — the same discipline as `package-lock.json` and a Node image. `pyproject.toml` declares direct dependencies, the lockfile pins the full resolved tree with hashes, and the image installs from the lock so the build is reproducible. Then Uvicorn workers behind a process supervisor, which is the Python equivalent of PM2 in cluster mode.
+@deep
+The failure this prevents is the classic "works on my machine": a loose `requirements.txt` with unpinned transitive dependencies resolves differently on different days, so a build that succeeded last week installs a new minor version today and breaks.
+
+Layer ordering in the Dockerfile matters for build time in exactly the way it does for Node — dependencies are copied and installed before application code, so a code change does not invalidate the dependency layer.
+@code text The Python equivalents of a stack you already run
+  NODE                          PYTHON
+  ────────────────────────────────────────────────────────────────
+  package.json                  pyproject.toml
+  package-lock.json             uv.lock / poetry.lock / requirements.txt
+                                  compiled with hashes
+  npm ci                        uv sync --frozen  /  pip install --require-hashes
+  node_modules/                 .venv/
+  PM2 cluster mode              uvicorn --workers N   (or gunicorn -k uvicorn)
+  nodemon                       uvicorn --reload
+  ────────────────────────────────────────────────────────────────
+
+  # multi-stage: build deps, then a slim runtime
+  FROM python:3.12-slim AS deps
+  COPY pyproject.toml uv.lock ./
+  RUN uv sync --frozen --no-dev          ← cached until the lock changes
+
+  FROM python:3.12-slim
+  COPY --from=deps /app/.venv /app/.venv
+  COPY . .                                ← code changes invalidate only this
+  ENV PATH="/app/.venv/bin:$PATH"
+  USER app                                ← never run as root
+  CMD ["uvicorn","app.main:app","--host","0.0.0.0","--workers","4"]
+
+  WORKERS   one process per core; each has its own interpreter and GIL.
+            Behind Nginx exactly like the Node services — same reverse
+            proxy, same TLS termination, same health check.
+@end
+@senior
+The point I would make is that this is deliberately the same operational shape as the Node services I run in production — containerised, reverse-proxied by Nginx, process-supervised, health-checked, logging structured JSON to the same place. Introducing a second language should not mean introducing a second way of deploying, monitoring and rolling back, because that operational divergence is the actual cost of polyglot stacks and it is usually underestimated.
+
+I would also flag the one genuine difference: Python images are large if you are careless, because scientific dependencies pull in a lot. Multi-stage builds and slim base images matter more here than in Node, and it is worth checking the image size in CI rather than discovering a 2GB image at deploy time.
+@followup
+Where do you put the model or embedding files?
+@answer
+Not in the image, in almost every case. Baking a large model file into the container makes every build slow and every rollback expensive, and it couples model updates to code deploys. I would pull it at startup from object storage with the version pinned by an environment variable, cache it on a mounted volume so restarts are fast, and verify a checksum before use. That keeps the image small and lets me change the model version without rebuilding, which is the same argument as not baking configuration into an image.
+@red
+- An unpinned requirements.txt.
+- Installing dependencies after copying application code.
+- Running the container as root.
+- One process and no workers, then wondering why throughput is flat.
+
+### Python type hints versus TypeScript — how much do they actually give you?
+@short
+Less, and differently. Both are erased at runtime and both need a separate checker, but TypeScript's checker is mandatory in the build while Python's is optional and bolted on, so an unchecked Python codebase can carry annotations that are simply wrong. The counter-balance is Pydantic: where TypeScript gives you nothing at runtime, Pydantic uses the same annotations to enforce the type at the boundary, which is the one place it genuinely matters more.
+@deep
+The practical difference is enforcement. TypeScript will not emit if you configure it not to, and CI fails; `mypy` or `pyright` has to be added deliberately, and a codebase without it gets annotations that decay into documentation.
+
+Gradual typing is also more genuinely gradual in Python. Any unannotated function is invisible to the checker, so partial adoption is easy — and easy to stall halfway, which is the risk.
+@code text What each gives you, honestly
+                        TYPESCRIPT              PYTHON
+  runtime enforcement   none                    none (annotations erased)
+                        + Zod at boundaries     + PYDANTIC at boundaries ← real
+  checker               tsc, in the build       mypy/pyright, opt-in
+  strictness default    strict is a flag,       everything Any until you
+                        but conventionally on   turn on strict settings
+  ecosystem types       DefinitelyTyped, broad  py.typed, patchier
+  null safety           strictNullChecks        `X | None` + a strict checker
+  generics              structural, powerful    nominal-ish, improving fast
+
+  THE POINT I MAKE IN AN INTERVIEW
+   Neither language checks types at runtime. The difference between a
+   codebase where types help and one where they lie is whether the
+   checker runs in CI — that is a process decision, not a language one.
+   I put `mypy --strict` on new modules and leave legacy ones excluded,
+   which is exactly the incremental strategy I used migrating JS to TS.
+@end
+@senior
+The connection I would draw is to the migration on my CV. Moving a JavaScript codebase to TypeScript taught me that the value arrives only when the checker is enforced and the strictness ratchets — allowing `any` freely produces a codebase that looks typed and catches nothing. Python is the same shape of problem: annotations without `mypy` in CI are comments.
+
+Where I think Python is genuinely ahead is the boundary. Pydantic means the annotation on a request model is enforced at runtime with no extra declaration, whereas in TypeScript I must write a Zod schema alongside the interface and keep them aligned. So my honest summary is that TypeScript is stronger inside the codebase and Python is stronger at the edge of it.
+@followup
+Would you turn on strict typing for an existing untyped Python codebase?
+@answer
+Not globally on day one, because a large error count gets suppressed rather than fixed and the exercise loses credibility. I would enable the checker in CI with strictness scoped to new and touched modules, so the boundary of typed code expands with normal work, and put the strict settings in configuration per-package so the ratchet is visible and reviewable. That is the same approach that worked on the JavaScript to TypeScript migration, and the reason it works is that it never asks anyone to stop delivering features in order to adopt types.
+@red
+- Claiming Python type hints are enforced at runtime.
+- Annotations with no checker in CI.
+- A big-bang strict-mode conversion.
+
+### Would you build a new service in FastAPI or Express, and why?
+@short
+Whichever the work is actually made of. If the service is primarily calling models, embedding, or doing anything numerical or ML-adjacent, FastAPI — because the libraries are there and rewriting them in Node is not engineering, it is stubbornness. If it is a general web API in a stack that is already TypeScript, Express or Node, because sharing types and tooling with the clients is worth more than any framework difference. I would not make the choice on framework merit; both are fine.
+@deep
+The real cost of adding a second language is operational rather than syntactic: another build, another dependency scanner, another runtime to patch, another set of idioms for whoever is on call. That cost is fixed and recurring, so it needs a proportionate reason.
+
+The reason that usually justifies it is library gravity. The Python data and ML ecosystem has no equivalent in Node, so a pipeline that needs it should be Python and should talk to the rest of the system over an API or a queue.
+@code text The decision, and the shape it produces
+  CHOOSE PYTHON / FASTAPI WHEN
+   • the work is embeddings, ML, scientific or data-heavy
+   • the libraries you need only exist there
+   • the team's strength is Python
+
+  CHOOSE NODE / EXPRESS WHEN
+   • the clients are TypeScript and you want ONE contract type
+   • the work is I/O orchestration, webhooks, real-time
+   • you already operate Node and adding a language buys nothing
+
+  THE SHAPE I ACTUALLY BUILT (AI assistant project)
+    Next.js client
+        │
+        ▼
+    Node/TypeScript API  ← auth, sessions, streaming, tool calling,
+        │   ▲               shares types with the client
+        │   │
+        ▼   │ (async, via the database / queue — NOT in the request path)
+    Python ingestion  ← chunking, embedding, pgvector upsert
+        │
+        ▼
+    PostgreSQL + pgvector   ← the integration point is the DATA,
+                              not an RPC call between the two services
+
+  WHY THAT SEAM   ingestion is a batch job with a different scaling
+                  profile and different failure semantics from a request
+                  handler. Splitting on that boundary is not a language
+                  decision that happens to work — it is the right seam,
+                  and the language follows it.
+@end
+@senior
+The position I would defend is that the seam should be chosen for operational reasons first and the language assigned second. In the assistant project the ingestion pipeline is a batch workload that can fail, retry and take an hour; the API is a low-latency request handler. Those belong in separate deployables regardless of language, and once they are separate, the pipeline being Python costs almost nothing because the integration point is Postgres rather than a synchronous call.
+
+I would also say plainly that if the whole thing were Node, that would have been a reasonable outcome too — I would have used a hosted embedding API and skipped the Python service entirely. Choosing the polyglot version was partly to work properly in Python on something real, and I would not dress that up as a purely technical necessity.
+@followup
+Does that not mean two services to deploy for a small project?
+@answer
+It does, and for a small project that is a real cost I would weigh rather than wave away. The mitigation is that they are not two services in the demanding sense — the pipeline is a scheduled job, not a highly available API, so it has no uptime requirement, no load balancer and no autoscaling. It runs in the same Docker Compose stack, ships logs to the same place and is deployed by the same pipeline. If it had needed to be a synchronous dependency of the request path I would have thought much harder, because that turns a batch job into a component whose availability I now have to care about.
+@red
+- Choosing a framework on benchmarks rather than on the work.
+- Adding a second language without acknowledging the operational cost.
+- Putting a batch pipeline in the synchronous request path.
+
 # SECTION REST API Design | Designing the contract — the part that outlives your implementation.
 
 ### What makes an API RESTful?

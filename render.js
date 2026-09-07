@@ -24,7 +24,7 @@ const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
     headerTemplate: `<div style="width:100%;font-family:-apple-system,Helvetica,sans-serif;font-size:7.5pt;color:#8a93a6;padding:0 14mm;display:flex;justify-content:space-between;">
         <span>${cfg.title}</span><span>${cfg.owner}</span></div>`,
     footerTemplate: `<div style="width:100%;font-family:-apple-system,Helvetica,sans-serif;font-size:7.5pt;color:#8a93a6;padding:0 14mm;display:flex;justify-content:space-between;">
-        <span>536 Q&amp;A · React · Next.js · Node · Go · MySQL · Postgres · AWS · AI/RAG · Realtime</span>
+        <span>543 Q&amp;A · React · Next.js · Node · Go · MySQL · Postgres · AWS · AI/RAG · Realtime</span>
         <span>Page <span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
   });
   await browser.close();
